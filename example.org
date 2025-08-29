@@ -1,0 +1,23 @@
+#+title: My Project
+#+author: John Doe
+
+* TODO Project Setup :urgent:important:
+This is the main project setup task.
+It needs to be completed first.
+
+** DONE Initialize repository :git:
+CLOSED: [2024-01-01 Mon 10:00]
+The repository has been created.
+
+** IN-PROGRESS Setup development environment :dev:docker:
+Still working on the Docker configuration.
+
+* DONE Documentation :docs:
+CLOSED: [2024-01-01 Mon 15:00]
+All documentation is complete.
+
+** Research phase
+Initial research was thorough.
+
+** Writing phase
+Documentation written and reviewed.

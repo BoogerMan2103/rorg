@@ -1,0 +1,36 @@
+#+title: Test Org File
+#+author: Test User
+#+date: <2024-01-01>
+
+* TODO First task :urgent:important:
+This is the content of the first task.
+It has multiple lines.
+
+** DONE Subtask one :work:
+CLOSED: [2024-01-01 Mon 10:00]
+This subtask is completed.
+
+** IN-PROGRESS Subtask two :personal:health:
+This is still in progress.
+
+* DONE Second task :project:deadline:
+CLOSED: [2024-01-01 Mon 15:30]
+
+This task is completed.
+It also has some content.
+
+*** Deep nested task :nested:example:
+This is a deeply nested task.
+
+* CANCELLED Third task :cancelled:project:
+CLOSED: [2024-01-01 Mon 16:00]
+This task was cancelled.
+
+* Regular heading without status :simple:
+This is just a regular heading without any status.
+
+** Another subtask :sub:task:
+More content here.
+
+* WAITING Fourth task :waiting:external:
+Waiting for external input.
