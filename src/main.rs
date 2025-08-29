@@ -1717,10 +1717,9 @@ fn main() {
 				.action(clap::ArgAction::SetTrue),
 		)
 		.arg(
-			Arg::new("tui")
-				.short('t')
-				.long("tui")
-				.help("Launch TUI interface")
+			Arg::new("no-tui")
+				.long("no-tui")
+				.help("Disable TUI interface and use text output")
 				.action(clap::ArgAction::SetTrue),
 		)
 		.get_matches();
@@ -1729,7 +1728,7 @@ fn main() {
 	let verbose = matches.get_flag("verbose");
 	let format = matches.get_one::<String>("format").unwrap();
 	let show_summary = matches.get_flag("summary");
-	let use_tui = matches.get_flag("tui");
+	let use_tui = !matches.get_flag("no-tui");
 
 	if !Path::new(file_path).exists() {
 		eprintln!("Error: File '{}' does not exist", file_path);
@@ -1745,18 +1744,18 @@ fn main() {
 	};
 
 	if verbose {
-		println!("Parsing file: {}", file_path);
-		println!("File size: {} bytes", content.len());
-		println!("Lines: {}", content.lines().count());
-		println!();
+		eprintln!("Parsing file: {}", file_path);
+		eprintln!("File size: {} bytes", content.len());
+		eprintln!("Lines: {}", content.lines().count());
+		eprintln!();
 	}
 
 	let mut parser = OrgParser::new(&content);
 	let notes = parser.parse();
 
 	if verbose {
-		println!("Found {} top-level notes", notes.len());
-		println!();
+		eprintln!("Found {} top-level notes", notes.len());
+		eprintln!();
 	}
 
 	if use_tui {
