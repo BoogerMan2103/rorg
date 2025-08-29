@@ -1,10 +1,9 @@
-#+title: Time Tracking Test File
-#+author: Test User
-#+date: <2024-01-15>
-
 * TODO Project Alpha :urgent:project:
-SCHEDULED: <2024-01-20 Sat 09:00>
-DEADLINE: <2024-01-31 Wed>
+SCHEDULED: <2025-08-30 10:00>
+DEADLINE: <2025-08-31 10:00>
+:LOGBOOK:
+CLOCK: [2025-08-30 Sat 00:54]
+:END:
 
 This is a project with scheduling information.
 Multiple lines of content here.
@@ -71,6 +70,21 @@ Need to check on progress.
 This is just a regular task without any time tracking
 or scheduling information.
 
-** Subtask also without time :sub:
+** Subtask with time :sub:time:
+SCHEDULED: <2025-08-30 Sat 10:11>
 
 Just regular content here.
+
+* TODO new note
+osnkjsndfkjsndf
+
+
+
+sldknf;kjgnek;jngljkbflajshdbflakjsdfnlaskjdfn
+
+
+
+ksjdnlkajgnlkajfdng
+
+
+
