@@ -4,6 +4,38 @@ use std::fs;
 use std::path::Path;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OrgTimestamp {
+    pub year: u32,
+    pub month: u32,
+    pub day: u32,
+    pub hour: Option<u32>,
+    pub minute: Option<u32>,
+    pub day_name: Option<String>,
+    pub raw: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OrgClockEntry {
+    pub start: OrgTimestamp,
+    pub end: Option<OrgTimestamp>,
+    pub duration: Option<String>,
+    pub raw: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OrgLogbook {
+    pub clock_entries: Vec<OrgClockEntry>,
+    pub raw_content: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OrgPlanning {
+    pub scheduled: Option<OrgTimestamp>,
+    pub deadline: Option<OrgTimestamp>,
+    pub closed: Option<OrgTimestamp>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OrgNote {
     pub level: usize,
     pub status: Option<String>,
@@ -11,6 +43,8 @@ pub struct OrgNote {
     pub labels: Vec<String>,
     pub content: String,
     pub children: Vec<OrgNote>,
+    pub planning: Option<OrgPlanning>,
+    pub logbook: Option<OrgLogbook>,
 }
 
 impl OrgNote {
@@ -22,6 +56,8 @@ impl OrgNote {
             labels: Vec::new(),
             content: String::new(),
             children: Vec::new(),
+            planning: None,
+            logbook: None,
         }
     }
 }
@@ -108,7 +144,12 @@ impl OrgParser {
             }
         }
 
-        note.content = content_lines.join("\n");
+        let content_text = content_lines.join("\n");
+        let (cleaned_content, planning, logbook) = self.parse_time_elements(&content_text);
+
+        note.content = cleaned_content;
+        note.planning = planning;
+        note.logbook = logbook;
         note.children = child_notes;
 
         Some(note)
@@ -165,6 +206,239 @@ impl OrgParser {
 
         (status, title, labels)
     }
+
+    fn parse_time_elements(
+        &self,
+        content: &str,
+    ) -> (String, Option<OrgPlanning>, Option<OrgLogbook>) {
+        let lines: Vec<&str> = content.lines().collect();
+        let mut cleaned_lines = Vec::new();
+        let mut planning = OrgPlanning {
+            scheduled: None,
+            deadline: None,
+            closed: None,
+        };
+        let mut logbook = None;
+        let mut in_logbook = false;
+        let mut logbook_lines = Vec::new();
+        let mut clock_entries = Vec::new();
+
+        for line in lines {
+            let trimmed = line.trim();
+
+            // Check for logbook start/end
+            if trimmed == ":LOGBOOK:" {
+                in_logbook = true;
+                continue;
+            } else if trimmed == ":END:" && in_logbook {
+                in_logbook = false;
+                logbook = Some(OrgLogbook {
+                    clock_entries: clock_entries.clone(),
+                    raw_content: logbook_lines.clone(),
+                });
+                logbook_lines.clear();
+                continue;
+            }
+
+            if in_logbook {
+                logbook_lines.push(line.to_string());
+                if let Some(clock_entry) = self.parse_clock_line(line) {
+                    clock_entries.push(clock_entry);
+                }
+                continue;
+            }
+
+            // Check for planning keywords
+            if let Some(timestamp) = self.extract_planning_timestamp(line, "SCHEDULED:") {
+                planning.scheduled = Some(timestamp);
+                continue;
+            } else if let Some(timestamp) = self.extract_planning_timestamp(line, "DEADLINE:") {
+                planning.deadline = Some(timestamp);
+                continue;
+            } else if let Some(timestamp) = self.extract_planning_timestamp(line, "CLOSED:") {
+                planning.closed = Some(timestamp);
+                continue;
+            }
+
+            cleaned_lines.push(line);
+        }
+
+        let has_planning = planning.scheduled.is_some()
+            || planning.deadline.is_some()
+            || planning.closed.is_some();
+        let final_planning = if has_planning { Some(planning) } else { None };
+
+        (cleaned_lines.join("\n"), final_planning, logbook)
+    }
+
+    fn extract_planning_timestamp(&self, line: &str, keyword: &str) -> Option<OrgTimestamp> {
+        if let Some(pos) = line.find(keyword) {
+            let after_keyword = &line[pos + keyword.len()..].trim();
+            self.parse_timestamp_from_text(after_keyword)
+        } else {
+            None
+        }
+    }
+
+    fn parse_clock_line(&self, line: &str) -> Option<OrgClockEntry> {
+        let trimmed = line.trim();
+        if !trimmed.starts_with("CLOCK:") {
+            return None;
+        }
+
+        let clock_content = &trimmed[6..].trim();
+
+        // Parse format: [start]--[end] => duration
+        if let Some(arrow_pos) = clock_content.find("=>") {
+            let time_part = &clock_content[..arrow_pos].trim();
+            let duration_part = clock_content[arrow_pos + 2..].trim();
+
+            if let Some(dash_pos) = time_part.find("--") {
+                let start_part = &time_part[..dash_pos].trim();
+                let end_part = &time_part[dash_pos + 2..].trim();
+
+                if let (Some(start), Some(end)) = (
+                    self.parse_timestamp_from_text(start_part),
+                    self.parse_timestamp_from_text(end_part),
+                ) {
+                    return Some(OrgClockEntry {
+                        start,
+                        end: Some(end),
+                        duration: Some(duration_part.to_string()),
+                        raw: line.to_string(),
+                    });
+                }
+            }
+        } else if let Some(timestamp) = self.parse_timestamp_from_text(clock_content) {
+            // Single timestamp (clock in, no clock out yet)
+            return Some(OrgClockEntry {
+                start: timestamp,
+                end: None,
+                duration: None,
+                raw: line.to_string(),
+            });
+        }
+
+        None
+    }
+
+    fn parse_timestamp_from_text(&self, text: &str) -> Option<OrgTimestamp> {
+        // Handle both [timestamp] and <timestamp> formats
+        let content = if text.starts_with('[') && text.ends_with(']') {
+            &text[1..text.len() - 1]
+        } else if text.starts_with('<') && text.ends_with('>') {
+            &text[1..text.len() - 1]
+        } else {
+            text
+        };
+
+        // Parse format like: "2024-01-01 Mon 10:00" or "2023-03-29 Ср"
+        let parts: Vec<&str> = content.split_whitespace().collect();
+        if parts.len() < 2 {
+            return None;
+        }
+
+        // Parse date part (YYYY-MM-DD)
+        let date_parts: Vec<&str> = parts[0].split('-').collect();
+        if date_parts.len() != 3 {
+            return None;
+        }
+
+        let year = date_parts[0].parse::<u32>().ok()?;
+        let month = date_parts[1].parse::<u32>().ok()?;
+        let day = date_parts[2].parse::<u32>().ok()?;
+
+        let day_name = if parts.len() > 1 {
+            Some(parts[1].to_string())
+        } else {
+            None
+        };
+
+        // Parse time part if present (HH:MM)
+        let (hour, minute) = if parts.len() > 2 {
+            let time_parts: Vec<&str> = parts[2].split(':').collect();
+            if time_parts.len() == 2 {
+                let h = time_parts[0].parse::<u32>().ok();
+                let m = time_parts[1].parse::<u32>().ok();
+                (h, m)
+            } else {
+                (None, None)
+            }
+        } else {
+            (None, None)
+        };
+
+        Some(OrgTimestamp {
+            year,
+            month,
+            day,
+            hour,
+            minute,
+            day_name,
+            raw: text.to_string(),
+        })
+    }
+}
+
+impl OrgTimestamp {
+    pub fn to_date_string(&self) -> String {
+        format!("{:04}-{:02}-{:02}", self.year, self.month, self.day)
+    }
+
+    pub fn to_datetime_string(&self) -> String {
+        if let (Some(hour), Some(minute)) = (self.hour, self.minute) {
+            format!("{} {:02}:{:02}", self.to_date_string(), hour, minute)
+        } else {
+            self.to_date_string()
+        }
+    }
+}
+
+impl OrgClockEntry {
+    pub fn parse_duration_minutes(&self) -> Option<u32> {
+        self.duration.as_ref().and_then(|d| {
+            let parts: Vec<&str> = d.trim().split(':').collect();
+            if parts.len() == 2 {
+                let hours = parts[0].parse::<u32>().ok()?;
+                let minutes = parts[1].parse::<u32>().ok()?;
+                Some(hours * 60 + minutes)
+            } else {
+                None
+            }
+        })
+    }
+
+    pub fn format_duration(&self) -> String {
+        if let Some(duration) = &self.duration {
+            format!(
+                "{} ({})",
+                duration,
+                if let Some(mins) = self.parse_duration_minutes() {
+                    format!("{} minutes", mins)
+                } else {
+                    "duration".to_string()
+                }
+            )
+        } else {
+            "running".to_string()
+        }
+    }
+}
+
+impl OrgLogbook {
+    pub fn total_minutes(&self) -> u32 {
+        self.clock_entries
+            .iter()
+            .filter_map(|entry| entry.parse_duration_minutes())
+            .sum()
+    }
+
+    pub fn format_total_time(&self) -> String {
+        let total_mins = self.total_minutes();
+        let hours = total_mins / 60;
+        let minutes = total_mins % 60;
+        format!("{}h {}m", hours, minutes)
+    }
 }
 
 fn print_notes(notes: &[OrgNote], indent: usize) {
@@ -183,6 +457,65 @@ fn print_notes(notes: &[OrgNote], indent: usize) {
             println!("{}Labels: {:?}", indent_str, note.labels);
         }
 
+        if let Some(planning) = &note.planning {
+            if planning.scheduled.is_some()
+                || planning.deadline.is_some()
+                || planning.closed.is_some()
+            {
+                println!("{}Planning:", indent_str);
+                if let Some(scheduled) = &planning.scheduled {
+                    println!(
+                        "{}  Scheduled: {} ({})",
+                        indent_str,
+                        scheduled.raw,
+                        scheduled.to_datetime_string()
+                    );
+                }
+                if let Some(deadline) = &planning.deadline {
+                    println!(
+                        "{}  Deadline: {} ({})",
+                        indent_str,
+                        deadline.raw,
+                        deadline.to_datetime_string()
+                    );
+                }
+                if let Some(closed) = &planning.closed {
+                    println!(
+                        "{}  Closed: {} ({})",
+                        indent_str,
+                        closed.raw,
+                        closed.to_datetime_string()
+                    );
+                }
+            }
+        }
+
+        if let Some(logbook) = &note.logbook {
+            if !logbook.clock_entries.is_empty() {
+                println!(
+                    "{}Time Tracking: (total: {})",
+                    indent_str,
+                    logbook.format_total_time()
+                );
+                for entry in &logbook.clock_entries {
+                    if entry.duration.is_some() {
+                        println!(
+                            "{}  Clock: {} => {}",
+                            indent_str,
+                            entry.start.to_datetime_string(),
+                            entry.format_duration()
+                        );
+                    } else {
+                        println!(
+                            "{}  Clock: {} (running)",
+                            indent_str,
+                            entry.start.to_datetime_string()
+                        );
+                    }
+                }
+            }
+        }
+
         if !note.content.trim().is_empty() {
             println!("{}Content:", indent_str);
             for line in note.content.lines() {
@@ -198,6 +531,81 @@ fn print_notes(notes: &[OrgNote], indent: usize) {
         }
 
         println!();
+    }
+}
+
+fn print_time_summary(notes: &[OrgNote]) {
+    let mut total_tracked_minutes = 0;
+    let mut completed_tasks = 0;
+    let mut active_tasks = 0;
+    let mut scheduled_tasks = 0;
+    let mut overdue_tasks = 0;
+
+    collect_time_stats(
+        notes,
+        &mut total_tracked_minutes,
+        &mut completed_tasks,
+        &mut active_tasks,
+        &mut scheduled_tasks,
+        &mut overdue_tasks,
+    );
+
+    println!("Time Tracking Summary:");
+    println!("=====================");
+    println!(
+        "Total tracked time: {}h {}m",
+        total_tracked_minutes / 60,
+        total_tracked_minutes % 60
+    );
+    println!("Completed tasks: {}", completed_tasks);
+    println!("Active tasks: {}", active_tasks);
+    println!("Scheduled tasks: {}", scheduled_tasks);
+    if overdue_tasks > 0 {
+        println!("⚠️  Overdue tasks: {}", overdue_tasks);
+    }
+    println!();
+}
+
+fn collect_time_stats(
+    notes: &[OrgNote],
+    total_minutes: &mut u32,
+    completed: &mut u32,
+    active: &mut u32,
+    scheduled: &mut u32,
+    overdue: &mut u32,
+) {
+    for note in notes {
+        if let Some(logbook) = &note.logbook {
+            *total_minutes += logbook.total_minutes();
+        }
+
+        match &note.status {
+            Some(status) if status == "DONE" => *completed += 1,
+            Some(status) if status == "TODO" || status == "IN-PROGRESS" => *active += 1,
+            _ => {}
+        }
+
+        if let Some(planning) = &note.planning {
+            if planning.scheduled.is_some() {
+                *scheduled += 1;
+            }
+
+            // Simple overdue check (tasks with deadlines in the past)
+            if let Some(deadline) = &planning.deadline {
+                if deadline.year < 2024 || (deadline.year == 2024 && deadline.month < 12) {
+                    *overdue += 1;
+                }
+            }
+        }
+
+        collect_time_stats(
+            &note.children,
+            total_minutes,
+            completed,
+            active,
+            scheduled,
+            overdue,
+        );
     }
 }
 
@@ -226,11 +634,19 @@ fn main() {
                 .value_parser(["text", "json"])
                 .default_value("text"),
         )
+        .arg(
+            Arg::new("summary")
+                .short('s')
+                .long("summary")
+                .help("Show time tracking summary statistics")
+                .action(clap::ArgAction::SetTrue),
+        )
         .get_matches();
 
     let file_path = matches.get_one::<String>("file").unwrap();
     let verbose = matches.get_flag("verbose");
     let format = matches.get_one::<String>("format").unwrap();
+    let show_summary = matches.get_flag("summary");
 
     if !Path::new(file_path).exists() {
         eprintln!("Error: File '{}' does not exist", file_path);
@@ -258,6 +674,10 @@ fn main() {
     if verbose {
         println!("Found {} top-level notes", notes.len());
         println!();
+    }
+
+    if show_summary {
+        print_time_summary(&notes);
     }
 
     match format.as_str() {
@@ -369,6 +789,122 @@ Final content."#;
         assert_eq!(notes[1].title, "Another task");
         assert_eq!(notes[1].labels, vec!["cancelled".to_string()]);
         assert_eq!(notes[1].content, "Final content.");
+    }
+
+    #[test]
+    fn test_parse_timestamp() {
+        let parser = OrgParser::new("");
+
+        let timestamp = parser
+            .parse_timestamp_from_text("[2024-01-01 Mon 10:30]")
+            .unwrap();
+        assert_eq!(timestamp.year, 2024);
+        assert_eq!(timestamp.month, 1);
+        assert_eq!(timestamp.day, 1);
+        assert_eq!(timestamp.hour, Some(10));
+        assert_eq!(timestamp.minute, Some(30));
+        assert_eq!(timestamp.day_name, Some("Mon".to_string()));
+
+        let timestamp2 = parser
+            .parse_timestamp_from_text("<2023-12-25 Mon>")
+            .unwrap();
+        assert_eq!(timestamp2.year, 2023);
+        assert_eq!(timestamp2.month, 12);
+        assert_eq!(timestamp2.day, 25);
+        assert_eq!(timestamp2.hour, None);
+        assert_eq!(timestamp2.minute, None);
+    }
+
+    #[test]
+    fn test_parse_planning_keywords() {
+        let content = r#"* TODO Task with planning
+SCHEDULED: <2024-01-01 Mon 09:00>
+DEADLINE: <2024-01-10 Wed>
+Some content here."#;
+
+        let mut parser = OrgParser::new(content);
+        let notes = parser.parse();
+
+        assert_eq!(notes.len(), 1);
+        let note = &notes[0];
+
+        assert!(note.planning.is_some());
+        let planning = note.planning.as_ref().unwrap();
+
+        assert!(planning.scheduled.is_some());
+        assert_eq!(planning.scheduled.as_ref().unwrap().year, 2024);
+        assert_eq!(planning.scheduled.as_ref().unwrap().hour, Some(9));
+
+        assert!(planning.deadline.is_some());
+        assert_eq!(planning.deadline.as_ref().unwrap().month, 1);
+        assert_eq!(planning.deadline.as_ref().unwrap().day, 10);
+    }
+
+    #[test]
+    fn test_parse_logbook() {
+        let content = r#"* DONE Task with time tracking
+:LOGBOOK:
+CLOCK: [2024-01-01 Mon 09:00]--[2024-01-01 Mon 12:00] =>  3:00
+CLOCK: [2024-01-02 Tue 14:00]--[2024-01-02 Tue 16:30] =>  2:30
+:END:
+Task completed with time tracking."#;
+
+        let mut parser = OrgParser::new(content);
+        let notes = parser.parse();
+
+        assert_eq!(notes.len(), 1);
+        let note = &notes[0];
+
+        assert!(note.logbook.is_some());
+        let logbook = note.logbook.as_ref().unwrap();
+
+        assert_eq!(logbook.clock_entries.len(), 2);
+        assert_eq!(logbook.clock_entries[0].duration, Some("3:00".to_string()));
+        assert_eq!(logbook.clock_entries[1].duration, Some("2:30".to_string()));
+
+        // Content should not include logbook
+        assert_eq!(note.content, "Task completed with time tracking.");
+
+        // Test total time calculation
+        assert_eq!(logbook.total_minutes(), 330); // 3:00 + 2:30 = 5:30 = 330 minutes
+        assert_eq!(logbook.format_total_time(), "5h 30m");
+    }
+
+    #[test]
+    fn test_timestamp_formatting() {
+        let timestamp = OrgTimestamp {
+            year: 2024,
+            month: 1,
+            day: 15,
+            hour: Some(14),
+            minute: Some(30),
+            day_name: Some("Mon".to_string()),
+            raw: "[2024-01-15 Mon 14:30]".to_string(),
+        };
+
+        assert_eq!(timestamp.to_date_string(), "2024-01-15");
+        assert_eq!(timestamp.to_datetime_string(), "2024-01-15 14:30");
+    }
+
+    #[test]
+    fn test_duration_parsing() {
+        let clock_entry = OrgClockEntry {
+            start: OrgTimestamp {
+                year: 2024,
+                month: 1,
+                day: 1,
+                hour: Some(9),
+                minute: Some(0),
+                day_name: Some("Mon".to_string()),
+                raw: "[2024-01-01 Mon 09:00]".to_string(),
+            },
+            end: None,
+            duration: Some("2:30".to_string()),
+            raw: "CLOCK: [2024-01-01 Mon 09:00]--[2024-01-01 Mon 11:30] =>  2:30".to_string(),
+        };
+
+        assert_eq!(clock_entry.parse_duration_minutes(), Some(150)); // 2:30 = 150 minutes
+        assert_eq!(clock_entry.format_duration(), "2:30 (150 minutes)");
     }
 
     #[test]
