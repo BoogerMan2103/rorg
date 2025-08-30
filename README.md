@@ -1,6 +1,8 @@
 # ROrgParser - Rust Org-Mode File Parser
 
-A command-line tool for parsing Emacs org-mode files written in Rust. This parser extracts the hierarchical structure of org-mode files, including headings, statuses, tags, and content.
+A command-line & tui tool for parsing Emacs org-mode files written in Rust. This parser extracts the hierarchical structure of org-mode files, including headings, statuses, tags, and content.
+
+> after several tries vibecoding this I realize it would probably better to move to pure emacs with only org mode
 
 ## Features
 
@@ -13,6 +15,9 @@ A command-line tool for parsing Emacs org-mode files written in Rust. This parse
 - **Time Statistics**: Provides summary statistics for tracked time and task completion
 - **Multiple Output Formats**: Supports both human-readable text and JSON output
 - **Verbose Mode**: Provides detailed parsing information
+
+## Known issues
+- Editing clock time in note metadata is not working
 
 ## Installation
 
@@ -70,7 +75,7 @@ The parser recognizes the following org-mode elements:
 
 ### Headings
 - `*` Level 1 heading
-- `**` Level 2 heading  
+- `**` Level 2 heading
 - `***` Level 3 heading
 - And so on...
 
@@ -232,7 +237,7 @@ Time Tracking Summary:
 =====================
 Total tracked time: 12h 15m
 Completed tasks: 2
-Active tasks: 1  
+Active tasks: 1
 Scheduled tasks: 2
 
 Parsed org-mode structure:
@@ -256,7 +261,7 @@ $ rorg --format json example.org
     "children": [
       {
         "level": 2,
-        "status": "DONE", 
+        "status": "DONE",
         "title": "Initialize repository",
         "labels": ["git"],
         "content": "The repository has been created.\n",
@@ -292,7 +297,7 @@ $ rorg --format json example.org
                 "day": 1,
                 "hour": 10,
                 "minute": 0,
-                "day_name": "Mon", 
+                "day_name": "Mon",
                 "raw": "[2024-01-01 Mon 10:00]"
               },
               "duration": "1:00",
@@ -358,7 +363,7 @@ The parser creates a hierarchical structure where each org heading becomes an `O
 
 ### Planning Keywords
 - `SCHEDULED:` - When a task should be started
-- `DEADLINE:` - When a task must be completed  
+- `DEADLINE:` - When a task must be completed
 - `CLOSED:` - When a task was actually completed
 - All planning information is extracted from content
 
