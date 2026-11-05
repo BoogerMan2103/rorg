@@ -1,390 +1,94 @@
-# ROrgParser - Rust Org-Mode File Parser
+# rorg — agent-friendly org-mode CLI
 
-A command-line & tui tool for parsing Emacs org-mode files written in Rust. This parser extracts the hierarchical structure of org-mode files, including headings, statuses, tags, and content.
+`rorg` lets a human or an LLM agent navigate and edit org-mode files **piece by piece**:
+find headings by keyword/text/tags/dates, look at one entry, change one field — without
+ever loading a whole (possibly 3000-line, possibly secret-laden) file into context.
 
-> after several tries vibecoding this I realize it would probably better to move to pure emacs with only org mode
+- **Lossless**: the file is kept as lines; edits splice only the affected lines. Everything else stays byte-for-byte identical.
+- **Compact output**: one line per heading by default, `--json` when structure is needed.
+- **Every write prints a diff** of exactly what changed; `--dry-run` previews without saving; writes are atomic (temp file + rename).
+- **Protected entries**: bodies of headings tagged `crypt` / `secret` (or inheriting them) are hidden and skipped by `grep` unless `--reveal`.
 
-## Features
-
-- **Hierarchical Parsing**: Correctly parses nested org-mode headings (*, **, ***, etc.)
-- **Status Detection**: Recognizes task statuses like TODO, DONE, IN-PROGRESS, etc.
-- **Tag Support**: Extracts org-mode tags (text between colons at the end of headings)
-- **Content Extraction**: Captures all text content between headings
-- **Time Tracking**: Parses LOGBOOK entries with CLOCK timestamps and duration calculations
-- **Planning Support**: Extracts SCHEDULED, DEADLINE, and CLOSED timestamps
-- **Time Statistics**: Provides summary statistics for tracked time and task completion
-- **Multiple Output Formats**: Supports both human-readable text and JSON output
-- **Verbose Mode**: Provides detailed parsing information
-
-## Known issues
-- Editing clock time in note metadata is not working
-
-## Installation
-
-### From Source
-
-1. Clone the repository:
-```bash
-git clone <repository-url>
-cd rorg
-```
-
-2. Build with Cargo:
-```bash
-cargo build --release
-```
-
-3. The binary will be available at `target/release/rorg`
-
-## Usage
-
-### Basic Usage
+## Install
 
 ```bash
-# Parse an org file with default text output
-rorg myfile.org
-
-# Parse with verbose information
-rorg --verbose myfile.org
-
-# Output as JSON
-rorg --format json myfile.org
-
-# Show time tracking summary
-rorg --summary myfile.org
-
-# Combine options
-rorg --verbose --summary --format json myfile.org
-
-# Get help
-rorg --help
+cargo install --path .
 ```
 
-### Command Line Options
+## Reading
 
-- `<file>`: The org-mode file to parse (required)
-- `-v, --verbose`: Enable verbose output showing file statistics
-- `-f, --format <format>`: Output format, either `text` (default) or `json`
-- `-s, --summary`: Show time tracking summary statistics
-- `-h, --help`: Show help information
-- `-V, --version`: Show version information
-
-## Org-Mode Structure Support
-
-The parser recognizes the following org-mode elements:
-
-### Headings
-- `*` Level 1 heading
-- `**` Level 2 heading
-- `***` Level 3 heading
-- And so on...
-
-### Status Keywords
-Any uppercase word immediately following the asterisks is treated as a status:
-- `* TODO My task`
-- `* DONE Completed task`
-- `* IN-PROGRESS Active task`
-- `* CANCELLED Cancelled task`
-
-### Tags
-Tags are extracted from text between colons at the end of headings:
-- `* TODO My task :urgent:important:`
-- `** DONE Subtask :work:project:`
-
-### Planning Keywords
-Planning information is extracted from content:
-- `SCHEDULED: <2024-01-20 Sat 09:00>`
-- `DEADLINE: <2024-01-31 Wed>`
-- `CLOSED: [2024-01-15 Mon 17:30]`
-
-### Time Tracking (LOGBOOK)
-LOGBOOK blocks with CLOCK entries are parsed:
-```org
-:LOGBOOK:
-CLOCK: [2024-01-15 Mon 09:00]--[2024-01-15 Mon 12:00] =>  3:00
-CLOCK: [2024-01-16 Tue 14:00]--[2024-01-16 Tue 17:30] =>  3:30
-:END:
-```
-
-### Content
-All text between headings is captured as content for the preceding heading.
-
-## Example
-
-### Input (example.org)
-```org
-#+title: My Project
-#+author: John Doe
-
-* TODO Project Setup :urgent:important:
-SCHEDULED: <2024-01-20 Sat 09:00>
-DEADLINE: <2024-01-31 Wed>
-
-This is the main project setup task.
-It needs to be completed first.
-
-** DONE Initialize repository :git:
-CLOSED: [2024-01-01 Mon 10:00]
-:LOGBOOK:
-CLOCK: [2024-01-01 Mon 09:00]--[2024-01-01 Mon 10:00] =>  1:00
-:END:
-
-The repository has been created.
-
-** IN-PROGRESS Setup development environment :dev:docker:
-:LOGBOOK:
-CLOCK: [2024-01-02 Tue 14:00]--[2024-01-02 Tue 17:30] =>  3:30
-CLOCK: [2024-01-03 Wed 10:00]
-:END:
-
-Still working on the Docker configuration.
-
-* DONE Documentation :docs:
-SCHEDULED: <2024-01-10 Wed 14:00>
-CLOSED: [2024-01-15 Mon 16:45]
-:LOGBOOK:
-CLOCK: [2024-01-12 Fri 13:00]--[2024-01-12 Fri 18:00] =>  5:00
-CLOCK: [2024-01-15 Mon 14:00]--[2024-01-15 Mon 16:45] =>  2:45
-:END:
-
-All documentation is complete.
-
-** Research phase
-Initial research was thorough.
-
-** Writing phase
-Documentation written and reviewed.
-```
-
-### Text Output
 ```bash
-$ rorg example.org
+rorg info ~/org/                       # sizes, TODO keywords in use, counts, tags
+rorg outline work.org --depth 2        # heading tree, no bodies
+rorg find ~/org --status WAIT          # all WAIT items across files
+rorg find work.org --todo --deadline ..+7d      # open items due within a week (incl. overdue)
+rorg find work.org --date 2026-11-10   # scheduled/deadline/active timestamp on that day
+rorg find work.org --text vendor --in-body --tag client
+rorg find work.org --scheduled none --todo      # unscheduled open tasks
+rorg show work.org 2.3                 # metadata + children, body size only
+rorg show work.org 2.3 --body          # plus body text
+rorg grep 'invoice' work.org           # matching lines with owning heading id
+rorg agenda ~/org -r today..+6d        # by day, plus overdue
+rorg clock work.org -r 2026-11-01..    # clocked time per heading
 ```
 
-```
-Parsed org-mode structure:
-========================
-Time Tracking Summary:
-=====================
-Total tracked time: 12h 15m
-Completed tasks: 2
-Active tasks: 1
-Scheduled tasks: 2
+Output line format: `ID  L<line>  KEYWORD [#P] Title  :tags:  sched:… dl:… closed:…  (in: Parent > …)`
 
-Level: 1
-Status: TODO
-Title: Project Setup
-Labels: ["urgent", "important"]
-Planning:
-  Scheduled: <2024-01-20 Sat 09:00> (2024-01-20 09:00)
-  Deadline: <2024-01-31 Wed> (2024-01-31)
-Content:
-  This is the main project setup task.
-  It needs to be completed first.
-Children:
-  Level: 2
-  Status: DONE
-  Title: Initialize repository
-  Labels: ["git"]
-  Planning:
-    Closed: [2024-01-01 Mon 10:00] (2024-01-01 10:00)
-  Time Tracking: (total: 1h 0m)
-    Clock: 2024-01-01 09:00 => 1:00 (60 minutes)
-  Content:
-    The repository has been created.
+## Selectors
 
-  Level: 2
-  Status: IN-PROGRESS
-  Title: Setup development environment
-  Labels: ["dev", "docker"]
-  Time Tracking: (total: 3h 30m)
-    Clock: 2024-01-02 14:00 => 3:30 (210 minutes)
-    Clock: 2024-01-03 10:00 (running)
-  Content:
-    Still working on the Docker configuration.
+| form       | meaning                                         |
+|------------|-------------------------------------------------|
+| `2.3.1`    | positional path, as printed by outline/find     |
+| `L120`     | heading whose section contains line 120         |
+| `id:abc`   | `:ID:` or `:CUSTOM_ID:` property                |
+| `@vendor`  | unique case-insensitive title substring         |
+| `@=Exact`  | exact title                                     |
 
-Level: 1
-Status: DONE
-Title: Documentation
-Labels: ["docs"]
-Planning:
-  Scheduled: <2024-01-10 Wed 14:00> (2024-01-10 14:00)
-  Closed: [2024-01-15 Mon 16:45] (2024-01-15 16:45)
-Time Tracking: (total: 7h 45m)
-  Clock: 2024-01-12 13:00 => 5:00 (300 minutes)
-  Clock: 2024-01-15 14:00 => 2:45 (165 minutes)
-Content:
-  All documentation is complete.
-Children:
-  Level: 2
-  Title: Research phase
-  Content:
-    Initial research was thorough.
+Positional ids shift after `add`/`move`/`delete`. Every write prints the new id; for
+safety add `--expect TEXT` (aborts unless the target title contains TEXT).
 
-  Level: 2
-  Title: Writing phase
-  Content:
-    Documentation written and reviewed.
-```
+## Dates
 
-### Summary Output
+`YYYY-MM-DD`, `today`, `tomorrow`, `yesterday`, `+3d`, `-1w`, `+1m`, `fri` (next Friday, today included).
+Ranges: `A..B`, `..B`, `A..`, `overdue`, `week`. Planning filters also take `any` / `none`.
+Repeaters (`+1w`, `++1d`, `.+1m`) are expanded when matching ranges.
+
+## Writing
+
 ```bash
-$ rorg --summary example.org
+rorg status work.org 2.3 DONE            # adds CLOSED; repeating tasks get dates shifted instead
+rorg status work.org 2.3 TODO            # removes CLOSED
+rorg schedule work.org @vendor "fri 10:00"
+rorg deadline work.org 2.3 none
+rorg tag work.org 2.3 --add urgent --rm someday
+rorg priority work.org 2.3 A
+rorg title work.org 2.3 "New title"
+rorg prop work.org 2.3 OWNER me
+rorg body work.org 2.3 --append "Called them, waiting for reply"
+echo "full new body" | rorg body work.org 2.3 --set -
+rorg add work.org --under 2 --title "Ping vendor" --status WAIT --scheduled +2d
+rorg move work.org 2.3 --under @Archive
+rorg delete work.org 2.3 --expect "Ping vendor"
 ```
 
+## TODO keywords
+
+Taken from the file's `#+TODO:` / `#+SEQ_TODO:` lines; otherwise `$RORG_TODO`
+(e.g. `export RORG_TODO="TODO NEXT WAIT | DONE CANCELLED"`); otherwise a broad default
+(`TODO NEXT STARTED IN-PROGRESS WAIT WAITING HOLD SOMEDAY | DONE CANCELLED CANCELED`).
+A word is only treated as a keyword if it is in that list. Check with `rorg info`.
+
+Protected tags are configurable via `$RORG_PROTECT_TAGS` (default `crypt,secret`).
+
+## Instructions for agents
+
+Paste into `CLAUDE.md` / `AGENTS.md` of the directory with org files:
+
+```markdown
+Org files here are managed through the `rorg` CLI. Do NOT cat/Read whole .org files.
+- Orient: `rorg info <file>`, `rorg outline <file> --depth 2`.
+- Locate: `rorg find` (filters: --status, --todo, --text, --in-body, --tag, --date, --scheduled, --deadline), `rorg grep`.
+- Inspect one entry: `rorg show <file> <id>`; add `--body` only when the body is needed.
+- Edit only via rorg write commands; pass `--expect "<title words>"` on writes; ids shift after add/move/delete, so re-query.
+- Never pass `--reveal` unless the user explicitly asks to see a protected entry.
 ```
-Time Tracking Summary:
-=====================
-Total tracked time: 12h 15m
-Completed tasks: 2
-Active tasks: 1
-Scheduled tasks: 2
-
-Parsed org-mode structure:
-========================
-[... full structure follows ...]
-```
-
-### JSON Output
-```bash
-$ rorg --format json example.org
-```
-
-```json
-[
-  {
-    "level": 1,
-    "status": "TODO",
-    "title": "Project Setup",
-    "labels": ["urgent", "important"],
-    "content": "This is the main project setup task.\nIt needs to be completed first.\n",
-    "children": [
-      {
-        "level": 2,
-        "status": "DONE",
-        "title": "Initialize repository",
-        "labels": ["git"],
-        "content": "The repository has been created.\n",
-        "children": [],
-        "planning": {
-          "scheduled": null,
-          "deadline": null,
-          "closed": {
-            "year": 2024,
-            "month": 1,
-            "day": 1,
-            "hour": 10,
-            "minute": 0,
-            "day_name": "Mon",
-            "raw": "[2024-01-01 Mon 10:00]"
-          }
-        },
-        "logbook": {
-          "clock_entries": [
-            {
-              "start": {
-                "year": 2024,
-                "month": 1,
-                "day": 1,
-                "hour": 9,
-                "minute": 0,
-                "day_name": "Mon",
-                "raw": "[2024-01-01 Mon 09:00]"
-              },
-              "end": {
-                "year": 2024,
-                "month": 1,
-                "day": 1,
-                "hour": 10,
-                "minute": 0,
-                "day_name": "Mon",
-                "raw": "[2024-01-01 Mon 10:00]"
-              },
-              "duration": "1:00",
-              "raw": "CLOCK: [2024-01-01 Mon 09:00]--[2024-01-01 Mon 10:00] =>  1:00"
-            }
-          ],
-          "raw_content": ["CLOCK: [2024-01-01 Mon 09:00]--[2024-01-01 Mon 10:00] =>  1:00"]
-        }
-      }
-    ],
-    "planning": {
-      "scheduled": {
-        "year": 2024,
-        "month": 1,
-        "day": 20,
-        "hour": 9,
-        "minute": 0,
-        "day_name": "Sat",
-        "raw": "<2024-01-20 Sat 09:00>"
-      },
-      "deadline": {
-        "year": 2024,
-        "month": 1,
-        "day": 31,
-        "hour": null,
-        "minute": null,
-        "day_name": "Wed",
-        "raw": "<2024-01-31 Wed>"
-      },
-      "closed": null
-    },
-    "logbook": null
-  }
-]
-```
-
-## Data Structure
-
-The parser creates a hierarchical structure where each org heading becomes an `OrgNote` with the following fields:
-
-- `level`: Number of asterisks (heading depth)
-- `status`: Optional status keyword (TODO, DONE, etc.)
-- `title`: The heading text without status and tags
-- `labels`: Array of tags extracted from the heading
-- `content`: Raw text content until the next heading (excludes LOGBOOK and planning)
-- `children`: Array of child `OrgNote` objects
-- `planning`: Optional planning information (SCHEDULED, DEADLINE, CLOSED timestamps)
-- `logbook`: Optional time tracking information (CLOCK entries with durations)
-
-## Time Tracking Features
-
-### Supported Timestamp Formats
-- `[2024-01-01 Mon 10:00]` - Closed timestamps (square brackets)
-- `<2024-01-20 Sat 09:00>` - Active timestamps (angle brackets)
-- Supports both date-only and date-time formats
-- Handles various day name formats (Mon, Monday, Пн, etc.)
-
-### LOGBOOK Processing
-- Automatically extracts CLOCK entries from `:LOGBOOK:` blocks
-- Calculates total time from duration entries
-- Supports both completed and running clock entries
-- Removes LOGBOOK content from the main content text
-
-### Planning Keywords
-- `SCHEDULED:` - When a task should be started
-- `DEADLINE:` - When a task must be completed
-- `CLOSED:` - When a task was actually completed
-- All planning information is extracted from content
-
-### Time Statistics
-The `--summary` option provides:
-- Total tracked time across all tasks
-- Count of completed, active, and scheduled tasks
-- Warning about overdue tasks
-
-## Limitations
-
-- Does not parse org-mode specific elements like tables, code blocks, or properties (except time tracking)
-- Tags must be at the end of the heading line in the format `:tag1:tag2:`
-- Status keywords must be uppercase and immediately follow the asterisks
-- CLOCK duration calculations rely on the duration field in the org format (` => HH:MM`)
-- Overdue detection uses simple date comparison (may need adjustment for your timezone)
-
-## Contributing
-
-Contributions are welcome! Please feel free to submit issues or pull requests.
-
-## License
-
-This project is licensed under the MIT License - see the LICENSE file for details.

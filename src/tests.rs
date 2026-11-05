@@ -1,225 +1,315 @@
-#[cfg(test)]
-mod tests {
-	use crate::{OrgClockEntry, OrgParser, OrgTimestamp};
+use crate::doc::{Doc, PlanKind};
+use crate::edit::{NewEntry, Pos, StatusOutcome};
+use crate::ts::{self, DateFilter, DateRange};
+use chrono::{NaiveDate, NaiveDateTime};
+use std::path::Path;
 
-	#[test]
-	fn test_count_asterisks() {
-		let parser = OrgParser::new("");
+const SAMPLE: &str = "#+TODO: TODO WAIT | DONE CANCELLED
+#+FILETAGS: :work:
 
-		assert_eq!(parser.count_asterisks("* Heading"), Some(1));
-		assert_eq!(parser.count_asterisks("** Subheading"), Some(2));
-		assert_eq!(parser.count_asterisks("*** Deep heading"), Some(3));
-		assert_eq!(parser.count_asterisks("  * Indented heading"), Some(1));
-		assert_eq!(parser.count_asterisks("*No space"), None);
-		assert_eq!(parser.count_asterisks("Not a heading"), None);
-		assert_eq!(parser.count_asterisks(""), None);
-	}
-
-	#[test]
-	fn test_parse_header_parts_with_status() {
-		let parser = OrgParser::new("");
-
-		let (status, title, labels) = parser.parse_header_parts("TODO My task");
-		assert_eq!(status, Some("TODO".to_string()));
-		assert_eq!(title, "My task");
-		assert_eq!(labels, Vec::<String>::new());
-	}
-
-	#[test]
-	fn test_parse_header_parts_with_tags() {
-		let parser = OrgParser::new("");
-
-		let (status, title, labels) = parser.parse_header_parts("TODO My task :urgent:important:");
-		assert_eq!(status, Some("TODO".to_string()));
-		assert_eq!(title, "My task");
-		assert_eq!(labels, vec!["urgent".to_string(), "important".to_string()]);
-	}
-
-	#[test]
-	fn test_parse_header_parts_no_status() {
-		let parser = OrgParser::new("");
-
-		let (status, title, labels) = parser.parse_header_parts("Just a heading :tag:");
-		assert_eq!(status, None);
-		assert_eq!(title, "Just a heading");
-		assert_eq!(labels, vec!["tag".to_string()]);
-	}
-
-	#[test]
-	fn test_parse_header_parts_no_tags() {
-		let parser = OrgParser::new("");
-
-		let (status, title, labels) = parser.parse_header_parts("DONE Completed task");
-		assert_eq!(status, Some("DONE".to_string()));
-		assert_eq!(title, "Completed task");
-		assert_eq!(labels, Vec::<String>::new());
-	}
-
-	#[test]
-	fn test_parse_simple_org_content() {
-		let content = r#"* TODO First task
-Some content here.
-** DONE Subtask :work:
-Subtask content.
-* CANCELLED Another task :cancelled:
-Final content."#;
-
-		let mut parser = OrgParser::new(content);
-		let notes = parser.parse();
-
-		assert_eq!(notes.len(), 2);
-
-		// First note
-		assert_eq!(notes[0].level, 1);
-		assert_eq!(notes[0].status, Some("TODO".to_string()));
-		assert_eq!(notes[0].title, "First task");
-		assert_eq!(notes[0].labels, Vec::<String>::new());
-		assert_eq!(notes[0].content, "Some content here.");
-		assert_eq!(notes[0].children.len(), 1);
-
-		// Child note
-		assert_eq!(notes[0].children[0].level, 2);
-		assert_eq!(notes[0].children[0].status, Some("DONE".to_string()));
-		assert_eq!(notes[0].children[0].title, "Subtask");
-		assert_eq!(notes[0].children[0].labels, vec!["work".to_string()]);
-		assert_eq!(notes[0].children[0].content, "Subtask content.");
-
-		// Second note
-		assert_eq!(notes[1].level, 1);
-		assert_eq!(notes[1].status, Some("CANCELLED".to_string()));
-		assert_eq!(notes[1].title, "Another task");
-		assert_eq!(notes[1].labels, vec!["cancelled".to_string()]);
-		assert_eq!(notes[1].content, "Final content.");
-	}
-
-	#[test]
-	fn test_parse_timestamp() {
-		let parser = OrgParser::new("");
-
-		let timestamp = parser
-			.parse_timestamp_from_text("[2024-01-01 Mon 10:30]")
-			.unwrap();
-		assert_eq!(timestamp.year, 2024);
-		assert_eq!(timestamp.month, 1);
-		assert_eq!(timestamp.day, 1);
-		assert_eq!(timestamp.hour, Some(10));
-		assert_eq!(timestamp.minute, Some(30));
-		assert_eq!(timestamp.day_name, Some("Mon".to_string()));
-
-		let timestamp2 = parser
-			.parse_timestamp_from_text("<2023-12-25 Mon>")
-			.unwrap();
-		assert_eq!(timestamp2.year, 2023);
-		assert_eq!(timestamp2.month, 12);
-		assert_eq!(timestamp2.day, 25);
-		assert_eq!(timestamp2.hour, None);
-		assert_eq!(timestamp2.minute, None);
-	}
-
-	#[test]
-	fn test_parse_planning_keywords() {
-		let content = r#"* TODO Task with planning
-SCHEDULED: <2024-01-01 Mon 09:00>
-DEADLINE: <2024-01-10 Wed>
-Some content here."#;
-
-		let mut parser = OrgParser::new(content);
-		let notes = parser.parse();
-
-		assert_eq!(notes.len(), 1);
-		let note = &notes[0];
-
-		assert!(note.planning.is_some());
-		let planning = note.planning.as_ref().unwrap();
-
-		assert!(planning.scheduled.is_some());
-		assert_eq!(planning.scheduled.as_ref().unwrap().year, 2024);
-		assert_eq!(planning.scheduled.as_ref().unwrap().hour, Some(9));
-
-		assert!(planning.deadline.is_some());
-		assert_eq!(planning.deadline.as_ref().unwrap().month, 1);
-		assert_eq!(planning.deadline.as_ref().unwrap().day, 10);
-	}
-
-	#[test]
-	fn test_parse_logbook() {
-		let content = r#"* DONE Task with time tracking
-:LOGBOOK:
-CLOCK: [2024-01-01 Mon 09:00]--[2024-01-01 Mon 12:00] =>  3:00
-CLOCK: [2024-01-02 Tue 14:00]--[2024-01-02 Tue 16:30] =>  2:30
+* TODO [#A] Project Setup                                          :urgent:
+SCHEDULED: <2024-01-10 Wed> DEADLINE: <2024-01-12 Fri>
+:PROPERTIES:
+:ID: setup-1
 :END:
-Task completed with time tracking."#;
+:LOGBOOK:
+CLOCK: [2024-01-01 Mon 09:00]--[2024-01-01 Mon 10:30] =>  1:30
+:END:
+Setup body line.
+Meeting <2024-01-11 Thu 15:00>.
 
-		let mut parser = OrgParser::new(content);
-		let notes = parser.parse();
+** DONE Initialize repository :git:
+CLOSED: [2024-01-01 Mon 10:00]
+Done.
 
-		assert_eq!(notes.len(), 1);
-		let note = &notes[0];
+** WAIT Answer from vendor
+* Secrets :crypt:
+password=hunter2
+* Habit
+SCHEDULED: <2024-01-01 Mon +1w>
+";
 
-		assert!(note.logbook.is_some());
-		let logbook = note.logbook.as_ref().unwrap();
+fn doc() -> Doc {
+	Doc::parse(Path::new("sample.org"), SAMPLE)
+}
 
-		assert_eq!(logbook.clock_entries.len(), 2);
-		assert_eq!(logbook.clock_entries[0].duration, Some("3:00".to_string()));
-		assert_eq!(logbook.clock_entries[1].duration, Some("2:30".to_string()));
+fn date(s: &str) -> NaiveDate {
+	NaiveDate::parse_from_str(s, "%Y-%m-%d").unwrap()
+}
 
-		// Content should not include logbook
-		assert_eq!(note.content, "Task completed with time tracking.");
+fn now() -> NaiveDateTime {
+	date("2024-02-01").and_hms_opt(12, 30, 0).unwrap()
+}
 
-		// Test total time calculation
-		assert_eq!(logbook.total_minutes(), 330); // 3:00 + 2:30 = 5:30 = 330 minutes
-		assert_eq!(logbook.format_total_time(), "5h 30m");
-	}
+#[test]
+fn roundtrip_is_lossless() {
+	assert_eq!(doc().render(), SAMPLE);
+	let no_nl = "* a\nb";
+	assert_eq!(Doc::parse(Path::new("x"), no_nl).render(), no_nl);
+}
 
-	#[test]
-	fn test_timestamp_formatting() {
-		let timestamp = OrgTimestamp {
-			year: 2024,
-			month: 1,
-			day: 15,
-			hour: Some(14),
-			minute: Some(30),
-			day_name: Some("Mon".to_string()),
-			raw: "[2024-01-15 Mon 14:30]".to_string(),
-		};
+#[test]
+fn parses_structure() {
+	let d = doc();
+	assert_eq!(d.keywords.todo, vec!["TODO", "WAIT"]);
+	assert_eq!(d.headings.len(), 5);
+	let h = &d.headings[0];
+	assert_eq!(
+		(h.keyword.as_deref(), h.priority, h.title.as_str()),
+		(Some("TODO"), Some('A'), "Project Setup")
+	);
+	assert_eq!(h.tags, vec!["urgent"]);
+	assert_eq!(
+		h.planning.scheduled.as_ref().unwrap().date,
+		date("2024-01-10")
+	);
+	assert_eq!(
+		h.planning.deadline.as_ref().unwrap().date,
+		date("2024-01-12")
+	);
+	assert_eq!(h.prop("id"), Some("setup-1"));
+	assert_eq!(h.clock_minutes(), 90);
+	assert_eq!(
+		&d.lines[d.body_range(0)],
+		&["Setup body line.", "Meeting <2024-01-11 Thu 15:00>."]
+	);
+	assert!(
+		h.timestamps
+			.iter()
+			.any(|t| t.active && t.date == date("2024-01-11"))
+	);
+	assert_eq!(d.headings[1].id(), "1.1");
+	assert_eq!(d.headings[2].id(), "1.2");
+	assert_eq!(d.all_tags(1), vec!["work", "urgent", "git"]);
+}
 
-		assert_eq!(timestamp.to_date_string(), "2024-01-15");
-		assert_eq!(timestamp.to_datetime_string(), "2024-01-15 14:30");
-	}
+#[test]
+fn keyword_must_be_known() {
+	let d = Doc::parse(
+		Path::new("x"),
+		"#+TODO: TODO | DONE\n* WAIT not a keyword here\n",
+	);
+	assert_eq!(d.headings[0].keyword, None);
+	assert_eq!(d.headings[0].title, "WAIT not a keyword here");
+}
 
-	#[test]
-	fn test_duration_parsing() {
-		let clock_entry = OrgClockEntry {
-			start: OrgTimestamp {
-				year: 2024,
-				month: 1,
-				day: 1,
-				hour: Some(9),
-				minute: Some(0),
-				day_name: Some("Mon".to_string()),
-				raw: "[2024-01-01 Mon 09:00]".to_string(),
+#[test]
+fn selectors() {
+	let d = doc();
+	assert_eq!(d.resolve("1.2").unwrap(), 2);
+	assert_eq!(d.resolve("L12").unwrap(), 0);
+	assert_eq!(d.resolve("id:setup-1").unwrap(), 0);
+	assert_eq!(d.resolve("@vendor").unwrap(), 2);
+	assert_eq!(d.resolve("@=Habit").unwrap(), 4);
+	assert!(d.resolve("@e").unwrap_err().contains("ambiguous"));
+	assert!(d.resolve("9.9").is_err());
+	assert!(
+		d.resolve("L1")
+			.unwrap_err()
+			.contains("before the first heading")
+	);
+}
+
+#[test]
+fn protected_tags() {
+	let d = doc();
+	assert!(d.is_protected(3));
+	assert!(!d.is_protected(0));
+}
+
+#[test]
+fn date_ranges_and_repeaters() {
+	let today = date("2024-01-10");
+	assert_eq!(
+		ts::parse_date_expr("tomorrow", today).unwrap(),
+		date("2024-01-11")
+	);
+	assert_eq!(
+		ts::parse_date_expr("+1w", today).unwrap(),
+		date("2024-01-17")
+	);
+	assert_eq!(
+		ts::parse_date_expr("fri", today).unwrap(),
+		date("2024-01-12")
+	);
+	assert_eq!(ts::parse_date_expr("wed", today).unwrap(), today);
+	let r = DateRange::parse("..yesterday", today).unwrap();
+	assert_eq!((r.start, r.end), (None, Some(date("2024-01-09"))));
+
+	let d = doc();
+	let habit = d.headings[4].planning.scheduled.clone().unwrap();
+	assert!(habit.occurs_in(&DateRange::parse("2024-01-15", today).unwrap()));
+	assert!(!habit.occurs_in(&DateRange::parse("2024-01-16", today).unwrap()));
+	assert!(DateFilter::parse("none", today).unwrap().matches(None));
+	assert_eq!(
+		ts::parse_when("2024-03-01 10:00 +1w", today, false).unwrap(),
+		"<2024-03-01 Fri 10:00 +1w>"
+	);
+	assert_eq!(
+		ts::parse_when("2024-03-01", today, true).unwrap(),
+		"<2024-03-01 Пт>"
+	);
+	assert!(ts::parse_when("2024-03-01 junk", today, false).is_err());
+}
+
+#[test]
+fn status_done_adds_and_removes_closed() {
+	let mut d = doc();
+	d.set_keyword(2, Some("DONE".into()), true, now()).unwrap();
+	assert_eq!(d.lines[18], "** DONE Answer from vendor");
+	assert_eq!(d.lines[19], "CLOSED: [2024-02-01 Thu 12:30]");
+	d.set_keyword(2, Some("TODO".into()), true, now()).unwrap();
+	assert_eq!(
+		d.render(),
+		SAMPLE.replace("** WAIT Answer", "** TODO Answer")
+	);
+	assert!(d.set_keyword(2, Some("NOPE".into()), true, now()).is_err());
+}
+
+#[test]
+fn status_keeps_tag_alignment() {
+	let mut d = doc();
+	let before = d.lines[3].chars().count();
+	d.set_keyword(0, Some("WAIT".into()), false, now()).unwrap();
+	assert!(d.lines[3].starts_with("* WAIT [#A] Project Setup  "));
+	assert_eq!(d.lines[3].chars().count(), before);
+}
+
+#[test]
+fn repeating_task_shifts_instead_of_closing() {
+	let mut d = doc();
+	let i = d.resolve("@habit").unwrap();
+	d.headings[i].keyword = None;
+	assert!(matches!(
+		d.set_keyword(i, Some("DONE".into()), true, now()).unwrap(),
+		StatusOutcome::Repeated
+	));
+	let h = &d.headings[i];
+	assert_eq!(
+		h.planning.scheduled.as_ref().unwrap().raw,
+		"<2024-01-08 Mon +1w>"
+	);
+	assert!(h.planning.closed.is_none());
+	assert!(h.prop("LAST_REPEAT").is_some());
+}
+
+#[test]
+fn planning_edits() {
+	let mut d = doc();
+	d.set_planning(0, PlanKind::Scheduled, None).unwrap();
+	assert_eq!(d.lines[4], "DEADLINE: <2024-01-12 Fri>");
+	d.set_planning(0, PlanKind::Deadline, None).unwrap();
+	assert_eq!(d.lines[4], ":PROPERTIES:");
+	d.set_planning(2, PlanKind::Scheduled, Some("<2024-02-02 Fri>".into()))
+		.unwrap();
+	let i = d.resolve("@vendor").unwrap();
+	assert_eq!(
+		d.lines[d.headings[i].line + 1],
+		"SCHEDULED: <2024-02-02 Fri>"
+	);
+	d.set_planning(i, PlanKind::Deadline, Some("<2024-02-05 Mon>".into()))
+		.unwrap();
+	assert_eq!(
+		d.lines[d.headings[i].line + 1],
+		"SCHEDULED: <2024-02-02 Fri> DEADLINE: <2024-02-05 Mon>"
+	);
+}
+
+#[test]
+fn properties() {
+	let mut d = doc();
+	d.set_property(0, "OWNER", Some("me")).unwrap();
+	assert_eq!(d.headings[0].prop("OWNER"), Some("me"));
+	d.set_property(0, "OWNER", None).unwrap();
+	d.set_property(0, "ID", None).unwrap();
+	assert!(d.headings[0].props_range.is_none());
+	d.set_property(2, "X", Some("1")).unwrap();
+	let l = d.headings[2].line;
+	assert_eq!(&d.lines[l + 1..l + 4], &[":PROPERTIES:", ":X: 1", ":END:"]);
+}
+
+#[test]
+fn body_edits() {
+	let mut d = doc();
+	d.append_body(0, "Appended.").unwrap();
+	assert_eq!(&d.lines[d.body_range(0)].last().unwrap()[..], "Appended.");
+	assert_eq!(
+		d.lines[d.body_range(0).end],
+		"",
+		"blank separator before child kept"
+	);
+	d.set_body(0, "Only this.").unwrap();
+	assert_eq!(&d.lines[d.body_range(0)], &["Only this."]);
+	assert!(
+		d.lines.iter().any(|l| l.starts_with("CLOCK:")),
+		"logbook untouched"
+	);
+	assert!(d.append_body(0, "* sneaky heading").is_err());
+}
+
+#[test]
+fn add_move_delete() {
+	let mut d = doc();
+	let entry = |title| NewEntry {
+		title,
+		keyword: Some("TODO".into()),
+		priority: None,
+		tags: vec!["x".into()],
+		scheduled: Some("<2024-02-02 Fri>".into()),
+		deadline: None,
+		body: Some("note"),
+	};
+	let i = d
+		.add_heading(
+			Pos::Under {
+				parent: 0,
+				first: false,
 			},
-			end: None,
-			duration: Some("2:30".to_string()),
-			raw: "CLOCK: [2024-01-01 Mon 09:00]--[2024-01-01 Mon 11:30] =>  2:30".to_string(),
-		};
+			entry("New child"),
+		)
+		.unwrap();
+	assert_eq!(d.headings[i].id(), "1.3");
+	assert_eq!(d.lines[d.headings[i].line], "** TODO New child :x:");
+	let j = d
+		.add_heading(
+			Pos::Under {
+				parent: 0,
+				first: true,
+			},
+			entry("First child"),
+		)
+		.unwrap();
+	assert_eq!(d.headings[j].id(), "1.1");
 
-		assert_eq!(clock_entry.parse_duration_minutes(), Some(150)); // 2:30 = 150 minutes
-		assert_eq!(clock_entry.format_duration(), "2:30 (150 minutes)");
-	}
+	let k = d.resolve("@=New child").unwrap();
+	let k = d.move_subtree(k, Pos::Top { first: false }).unwrap();
+	assert_eq!(d.lines[d.headings[k].line], "* TODO New child :x:");
+	assert_eq!(d.headings[k].id(), "4");
 
-	#[test]
-	fn test_parse_empty_content() {
-		let mut parser = OrgParser::new("");
-		let notes = parser.parse();
-		assert_eq!(notes.len(), 0);
-	}
+	let k = d
+		.move_subtree(
+			k,
+			Pos::Under {
+				parent: d.resolve("@vendor").unwrap(),
+				first: false,
+			},
+		)
+		.unwrap();
+	assert_eq!(d.lines[d.headings[k].line], "*** TODO New child :x:");
+	assert!(
+		d.move_subtree(
+			0,
+			Pos::Under {
+				parent: k,
+				first: false
+			}
+		)
+		.is_err()
+	);
 
-	#[test]
-	fn test_parse_no_headings() {
-		let content = "Just some text\nwithout any headings\nat all.";
-		let mut parser = OrgParser::new(content);
-		let notes = parser.parse();
-		assert_eq!(notes.len(), 0);
-	}
+	let n = d.resolve("@=First child").unwrap();
+	d.delete_subtree(n);
+	let k = d.resolve("@=New child").unwrap();
+	d.delete_subtree(k);
+	assert_eq!(d.render(), SAMPLE);
 }

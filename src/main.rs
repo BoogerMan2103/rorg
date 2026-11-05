@@ -1,1789 +1,1333 @@
-use chrono::{Datelike, Local, Timelike};
-use clap::{Arg, Command};
-use crossterm::{
-	event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers},
-	execute,
-	terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
-};
-use ratatui::{
-	Frame, Terminal,
-	backend::{Backend, CrosstermBackend},
-	layout::{Constraint, Direction, Layout, Rect},
-	style::{Color, Modifier, Style},
-	text::{Line, Span},
-	widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
-};
-use serde::{Deserialize, Serialize};
-use std::fs;
-use std::io;
-use std::path::Path;
+mod doc;
+mod edit;
+mod ts;
 
+#[cfg(test)]
 mod tests;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct OrgTimestamp {
-	pub year: u32,
-	pub month: u32,
-	pub day: u32,
-	pub hour: Option<u32>,
-	pub minute: Option<u32>,
-	pub day_name: Option<String>,
-	pub raw: String,
+use chrono::{Local, NaiveDate, NaiveDateTime};
+use clap::{Args, Parser, Subcommand};
+use doc::{Doc, PlanKind};
+use edit::{NewEntry, Pos, StatusOutcome};
+use regex::RegexBuilder;
+use serde::Serialize;
+use serde_json::json;
+use std::collections::BTreeMap;
+use std::io::Read;
+use std::path::{Path, PathBuf};
+use ts::{DateFilter, DateRange};
+
+const ABOUT: &str = "Query and edit org-mode files piece by piece, without loading whole files.
+
+Selectors (SEL): 1.2.3 = positional path (as printed by outline/find) · L42 = heading containing line 42 ·
+id:XYZ = :ID:/:CUSTOM_ID: property · @text = unique title substring · @=Title = exact title.
+Dates: YYYY-MM-DD, today, tomorrow, yesterday, +3d, -1w, +1m, fri. Ranges: A..B, ..B, A.., overdue, week.
+Positional ids shift after add/move/delete — re-query (every write prints the new id),
+or guard writes with --expect TEXT (aborts unless the target title contains TEXT).
+Bodies of headings tagged crypt/secret (or inheriting them) are hidden unless --reveal ($RORG_PROTECT_TAGS).
+TODO keywords come from #+TODO lines, else $RORG_TODO, else a broad default (see `rorg info`).";
+
+#[derive(Parser)]
+#[command(name = "rorg", version, about = "Agent-friendly org-mode query/edit CLI", long_about = ABOUT)]
+struct Cli {
+	/// JSON output (outline, find, show, grep, writes)
+	#[arg(long, global = true)]
+	json: bool,
+	/// For write commands: print the diff, don't save
+	#[arg(long, global = true)]
+	dry_run: bool,
+	/// For write commands: abort unless the target heading's title contains this text
+	#[arg(long, global = true)]
+	expect: Option<String>,
+	#[command(subcommand)]
+	cmd: Cmd,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct OrgClockEntry {
-	pub start: OrgTimestamp,
-	pub end: Option<OrgTimestamp>,
-	pub duration: Option<String>,
-	pub raw: String,
+#[derive(Subcommand)]
+enum Cmd {
+	/// Overview: size, TODO keywords, keyword counts, tags
+	Info {
+		#[arg(required = true)]
+		paths: Vec<PathBuf>,
+	},
+	/// Heading tree (no bodies)
+	Outline {
+		#[arg(required = true)]
+		paths: Vec<PathBuf>,
+		/// Max heading level to show
+		#[arg(short, long)]
+		depth: Option<usize>,
+		/// Only the subtree of this heading (single file)
+		#[arg(long)]
+		under: Option<String>,
+	},
+	/// Find headings by keyword, text, tags, dates, properties
+	Find(FindArgs),
+	/// One heading: metadata, children; body only with --body
+	Show {
+		file: PathBuf,
+		sel: String,
+		/// Print the free-text body (without drawers)
+		#[arg(long)]
+		body: bool,
+		/// Print raw lines of the section (heading, planning, drawers, body)
+		#[arg(long)]
+		raw: bool,
+		/// With --raw: include the whole subtree
+		#[arg(long)]
+		subtree: bool,
+		#[arg(long, default_value_t = 200)]
+		max_lines: usize,
+		/// Show body even for protected (crypt/secret) headings
+		#[arg(long)]
+		reveal: bool,
+	},
+	/// Search lines by regex; prints line number, owning heading id, the line
+	Grep {
+		pattern: String,
+		#[arg(required = true)]
+		paths: Vec<PathBuf>,
+		/// Case-sensitive (default: smart case)
+		#[arg(short = 's', long)]
+		case_sensitive: bool,
+		#[arg(long, default_value_t = 50)]
+		limit: usize,
+		#[arg(long)]
+		reveal: bool,
+	},
+	/// Scheduled/deadline/timestamped open items by day, plus overdue
+	Agenda {
+		#[arg(required = true)]
+		paths: Vec<PathBuf>,
+		#[arg(short, long, default_value = "today..+6d")]
+		range: String,
+		/// Include done items
+		#[arg(long)]
+		all: bool,
+	},
+	/// Clocked time per heading
+	Clock {
+		#[arg(required = true)]
+		paths: Vec<PathBuf>,
+		/// Only CLOCK entries starting in this range
+		#[arg(short, long)]
+		range: Option<String>,
+	},
+	/// Set TODO keyword (`none` to clear). Adds/removes CLOSED like org-log-done; handles repeaters
+	Status {
+		file: PathBuf,
+		sel: String,
+		keyword: String,
+		/// Don't touch CLOSED / LAST_REPEAT
+		#[arg(long)]
+		no_log: bool,
+	},
+	/// Replace heading title (keyword, priority, tags kept)
+	Title {
+		file: PathBuf,
+		sel: String,
+		text: String,
+	},
+	/// Change tags
+	Tag {
+		file: PathBuf,
+		sel: String,
+		#[arg(long, value_delimiter = ',')]
+		add: Vec<String>,
+		#[arg(long, value_delimiter = ',')]
+		rm: Vec<String>,
+		/// Replace all own tags (comma-separated, empty string clears)
+		#[arg(long)]
+		set: Option<String>,
+	},
+	/// Set priority letter, or `none`
+	Priority {
+		file: PathBuf,
+		sel: String,
+		value: String,
+	},
+	/// Set SCHEDULED (`none` removes). WHEN: DATE [HH:MM] [+1w] [-2d] or raw <...>
+	Schedule {
+		file: PathBuf,
+		sel: String,
+		when: String,
+	},
+	/// Set DEADLINE (`none` removes)
+	Deadline {
+		file: PathBuf,
+		sel: String,
+		when: String,
+	},
+	/// Set a property in the :PROPERTIES: drawer (omit VALUE with --unset to remove)
+	Prop {
+		file: PathBuf,
+		sel: String,
+		key: String,
+		value: Option<String>,
+		#[arg(long)]
+		unset: bool,
+	},
+	/// Append to or replace the free-text body. TEXT `-` reads stdin
+	Body {
+		file: PathBuf,
+		sel: String,
+		#[arg(long, conflicts_with = "set", required_unless_present = "set")]
+		append: Option<String>,
+		#[arg(long)]
+		set: Option<String>,
+	},
+	/// Insert a new heading
+	Add {
+		file: PathBuf,
+		#[command(flatten)]
+		pos: PosArgs,
+		#[arg(long)]
+		title: String,
+		#[arg(long)]
+		status: Option<String>,
+		#[arg(long, value_delimiter = ',')]
+		tags: Vec<String>,
+		#[arg(long)]
+		priority: Option<char>,
+		#[arg(long)]
+		scheduled: Option<String>,
+		#[arg(long)]
+		deadline: Option<String>,
+		/// Body text, `-` reads stdin
+		#[arg(long)]
+		body: Option<String>,
+	},
+	/// Delete a heading with its whole subtree
+	Delete { file: PathBuf, sel: String },
+	/// Move a subtree (refile within the file); levels are adjusted
+	Move {
+		file: PathBuf,
+		sel: String,
+		#[command(flatten)]
+		pos: PosArgs,
+	},
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct OrgLogbook {
-	pub clock_entries: Vec<OrgClockEntry>,
-	pub raw_content: Vec<String>,
+#[derive(Args)]
+#[group(required = true, multiple = false, id = "position")]
+struct PosArgs {
+	/// As child of SEL (last child, or first with --first)
+	#[arg(long, group = "position")]
+	under: Option<String>,
+	/// As next sibling of SEL
+	#[arg(long, group = "position")]
+	after: Option<String>,
+	/// As previous sibling of SEL
+	#[arg(long, group = "position")]
+	before: Option<String>,
+	/// As top-level heading (end of file, or start with --first)
+	#[arg(long, group = "position")]
+	top: bool,
+	#[arg(long)]
+	first: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct OrgPlanning {
-	pub scheduled: Option<OrgTimestamp>,
-	pub deadline: Option<OrgTimestamp>,
-	pub closed: Option<OrgTimestamp>,
+#[derive(Args)]
+struct FindArgs {
+	#[arg(required = true)]
+	paths: Vec<PathBuf>,
+	/// Keywords, comma-separated; `none` = no keyword
+	#[arg(short, long, value_delimiter = ',')]
+	status: Vec<String>,
+	/// Any not-done keyword
+	#[arg(long)]
+	todo: bool,
+	/// Any done keyword
+	#[arg(long)]
+	done: bool,
+	/// Title contains text (case-insensitive)
+	#[arg(short, long)]
+	text: Option<String>,
+	/// Treat --text as a regex
+	#[arg(long)]
+	regex: bool,
+	/// --text also matches body lines (protected bodies skipped)
+	#[arg(long)]
+	in_body: bool,
+	/// Has all these tags (inherited tags count)
+	#[arg(long = "tag", value_delimiter = ',')]
+	tags: Vec<String>,
+	#[arg(long = "not-tag", value_delimiter = ',')]
+	not_tags: Vec<String>,
+	#[arg(long)]
+	level: Option<usize>,
+	/// Only descendants of SEL (single file)
+	#[arg(long)]
+	under: Option<String>,
+	#[arg(long)]
+	priority: Option<char>,
+	/// RANGE | any | none
+	#[arg(long)]
+	scheduled: Option<String>,
+	#[arg(long)]
+	deadline: Option<String>,
+	#[arg(long)]
+	closed: Option<String>,
+	/// SCHEDULED, DEADLINE or any active timestamp in title/body falls in RANGE
+	#[arg(long)]
+	date: Option<String>,
+	/// KEY or KEY=VALUE
+	#[arg(long)]
+	prop: Vec<String>,
+	#[arg(long, default_value_t = 50)]
+	limit: usize,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct OrgNote {
-	pub level: usize,
-	pub status: Option<String>,
-	pub title: String,
-	pub labels: Vec<String>,
-	pub content: String,
-	pub children: Vec<OrgNote>,
-	pub planning: Option<OrgPlanning>,
-	pub logbook: Option<OrgLogbook>,
-}
-
-impl OrgNote {
-	pub fn new(level: usize, title: String) -> Self {
-		Self {
-			level,
-			status: None,
-			title,
-			labels: Vec::new(),
-			content: String::new(),
-			children: Vec::new(),
-			planning: None,
-			logbook: None,
-		}
-	}
-}
-
-pub struct OrgParser {
-	lines: Vec<String>,
-	current_line: usize,
-}
-
-impl OrgParser {
-	pub fn new(content: &str) -> Self {
-		Self {
-			lines: content.lines().map(|s| s.to_string()).collect(),
-			current_line: 0,
-		}
-	}
-
-	pub fn parse(&mut self) -> Vec<OrgNote> {
-		let mut notes = Vec::new();
-
-		while self.current_line < self.lines.len() {
-			let line = &self.lines[self.current_line];
-
-			if let Some(level) = self.count_asterisks(line) {
-				if let Some(note) = self.parse_note(level) {
-					notes.push(note);
-				}
-			} else {
-				self.current_line += 1;
-			}
-		}
-
-		notes
-	}
-
-	fn count_asterisks(&self, line: &str) -> Option<usize> {
-		let trimmed = line.trim_start();
-		if trimmed.starts_with('*') {
-			let count = trimmed.chars().take_while(|&c| c == '*').count();
-			if count > 0 && trimmed.chars().nth(count) == Some(' ') {
-				return Some(count);
-			}
-		}
-		None
-	}
-
-	fn parse_note(&mut self, level: usize) -> Option<OrgNote> {
-		if self.current_line >= self.lines.len() {
-			return None;
-		}
-
-		let line = &self.lines[self.current_line];
-		let header_content = self.extract_header_content(line, level);
-
-		let (status, title, labels) = self.parse_header_parts(&header_content);
-
-		let mut note = OrgNote::new(level, title);
-		note.status = status;
-		note.labels = labels;
-
-		self.current_line += 1;
-
-		// Collect content until next heading of same or higher level
-		let mut content_lines = Vec::new();
-		let mut child_notes = Vec::new();
-
-		while self.current_line < self.lines.len() {
-			let line = &self.lines[self.current_line];
-
-			if let Some(next_level) = self.count_asterisks(line) {
-				if next_level <= level {
-					// Same or higher level heading, stop collecting content
-					break;
-				} else {
-					// Child heading, parse it as a child note
-					if let Some(child_note) = self.parse_note(next_level) {
-						child_notes.push(child_note);
-					}
-				}
-			} else {
-				// Regular content line
-				content_lines.push(line.clone());
-				self.current_line += 1;
-			}
-		}
-
-		let content_text = content_lines.join("\n");
-		let (cleaned_content, planning, logbook) = self.parse_time_elements(&content_text);
-
-		note.content = cleaned_content;
-		note.planning = planning;
-		note.logbook = logbook;
-		note.children = child_notes;
-
-		Some(note)
-	}
-
-	fn extract_header_content(&self, line: &str, level: usize) -> String {
-		let trimmed = line.trim_start();
-		// Skip the asterisks and the space after them
-		trimmed.chars().skip(level + 1).collect()
-	}
-
-	fn parse_header_parts(&self, header: &str) -> (Option<String>, String, Vec<String>) {
-		let trimmed = header.trim();
-
-		// Extract labels (org-mode tags at the end, starting with :)
-		let mut labels = Vec::new();
-		let mut content = trimmed;
-
-		// Find the last space followed by a colon (start of tags section)
-		if let Some(tag_start) = trimmed.rfind(char::is_whitespace) {
-			let potential_tags = &trimmed[tag_start..].trim_start();
-			if potential_tags.starts_with(':')
-				&& potential_tags.ends_with(':')
-				&& potential_tags.len() > 2
-			{
-				// Extract tags between colons
-				let tags_content = &potential_tags[1..potential_tags.len() - 1];
-				labels = tags_content
-					.split(':')
-					.map(|s| s.trim().to_string())
-					.filter(|s| !s.is_empty())
-					.collect();
-				content = trimmed[..tag_start].trim();
-			}
-		}
-
-		// Extract status (first word if it's uppercase)
-		let words: Vec<&str> = content.split_whitespace().collect();
-		let mut status = None;
-		let mut title_start = 0;
-
-		if let Some(first_word) = words.first() {
-			if first_word
-				.chars()
-				.all(|c| c.is_uppercase() || !c.is_alphabetic())
-				&& first_word.len() > 0
-			{
-				status = Some(first_word.to_string());
-				title_start = 1;
-			}
-		}
-
-		let title = words[title_start..].join(" ");
-
-		(status, title, labels)
-	}
-
-	fn parse_time_elements(
-		&self,
-		content: &str,
-	) -> (String, Option<OrgPlanning>, Option<OrgLogbook>) {
-		let lines: Vec<&str> = content.lines().collect();
-		let mut cleaned_lines = Vec::new();
-		let mut planning = OrgPlanning {
-			scheduled: None,
-			deadline: None,
-			closed: None,
-		};
-		let mut logbook = None;
-		let mut in_logbook = false;
-		let mut logbook_lines = Vec::new();
-		let mut clock_entries = Vec::new();
-
-		for line in lines {
-			let trimmed = line.trim();
-
-			// Check for logbook start/end
-			if trimmed == ":LOGBOOK:" {
-				in_logbook = true;
-				continue;
-			} else if trimmed == ":END:" && in_logbook {
-				in_logbook = false;
-				logbook = Some(OrgLogbook {
-					clock_entries: clock_entries.clone(),
-					raw_content: logbook_lines.clone(),
-				});
-				logbook_lines.clear();
-				continue;
-			}
-
-			if in_logbook {
-				logbook_lines.push(line.to_string());
-				if let Some(clock_entry) = self.parse_clock_line(line) {
-					clock_entries.push(clock_entry);
-				}
-				continue;
-			}
-
-			// Check for planning keywords
-			if let Some(timestamp) = self.extract_planning_timestamp(line, "SCHEDULED:") {
-				planning.scheduled = Some(timestamp);
-				continue;
-			} else if let Some(timestamp) = self.extract_planning_timestamp(line, "DEADLINE:") {
-				planning.deadline = Some(timestamp);
-				continue;
-			} else if let Some(timestamp) = self.extract_planning_timestamp(line, "CLOSED:") {
-				planning.closed = Some(timestamp);
-				continue;
-			}
-
-			cleaned_lines.push(line);
-		}
-
-		let has_planning = planning.scheduled.is_some()
-			|| planning.deadline.is_some()
-			|| planning.closed.is_some();
-		let final_planning = if has_planning { Some(planning) } else { None };
-
-		(cleaned_lines.join("\n"), final_planning, logbook)
-	}
-
-	fn extract_planning_timestamp(&self, line: &str, keyword: &str) -> Option<OrgTimestamp> {
-		if let Some(pos) = line.find(keyword) {
-			let after_keyword = &line[pos + keyword.len()..].trim();
-			self.parse_timestamp_from_text(after_keyword)
-		} else {
-			None
-		}
-	}
-
-	fn parse_clock_line(&self, line: &str) -> Option<OrgClockEntry> {
-		let trimmed = line.trim();
-		if !trimmed.starts_with("CLOCK:") {
-			return None;
-		}
-
-		let clock_content = &trimmed[6..].trim();
-
-		// Parse format: [start]--[end] => duration
-		if let Some(arrow_pos) = clock_content.find("=>") {
-			let time_part = &clock_content[..arrow_pos].trim();
-			let duration_part = clock_content[arrow_pos + 2..].trim();
-
-			if let Some(dash_pos) = time_part.find("--") {
-				let start_part = &time_part[..dash_pos].trim();
-				let end_part = &time_part[dash_pos + 2..].trim();
-
-				if let (Some(start), Some(end)) = (
-					self.parse_timestamp_from_text(start_part),
-					self.parse_timestamp_from_text(end_part),
-				) {
-					return Some(OrgClockEntry {
-						start,
-						end: Some(end),
-						duration: Some(duration_part.to_string()),
-						raw: line.to_string(),
-					});
-				}
-			}
-		} else if let Some(timestamp) = self.parse_timestamp_from_text(clock_content) {
-			// Single timestamp (clock in, no clock out yet)
-			return Some(OrgClockEntry {
-				start: timestamp,
-				end: None,
-				duration: None,
-				raw: line.to_string(),
-			});
-		}
-
-		None
-	}
-
-	fn parse_timestamp_from_text(&self, text: &str) -> Option<OrgTimestamp> {
-		// Handle both [timestamp] and <timestamp> formats
-		let content = if text.starts_with('[') && text.ends_with(']') {
-			&text[1..text.len() - 1]
-		} else if text.starts_with('<') && text.ends_with('>') {
-			&text[1..text.len() - 1]
-		} else {
-			text
-		};
-
-		// Parse format like: "2024-01-01 Mon 10:00" or "2023-03-29 Ср"
-		let parts: Vec<&str> = content.split_whitespace().collect();
-		if parts.len() < 2 {
-			return None;
-		}
-
-		// Parse date part (YYYY-MM-DD)
-		let date_parts: Vec<&str> = parts[0].split('-').collect();
-		if date_parts.len() != 3 {
-			return None;
-		}
-
-		let year = date_parts[0].parse::<u32>().ok()?;
-		let month = date_parts[1].parse::<u32>().ok()?;
-		let day = date_parts[2].parse::<u32>().ok()?;
-
-		let day_name = if parts.len() > 1 {
-			Some(parts[1].to_string())
-		} else {
-			None
-		};
-
-		// Parse time part if present (HH:MM)
-		let (hour, minute) = if parts.len() > 2 {
-			let time_parts: Vec<&str> = parts[2].split(':').collect();
-			if time_parts.len() == 2 {
-				let h = time_parts[0].parse::<u32>().ok();
-				let m = time_parts[1].parse::<u32>().ok();
-				(h, m)
-			} else {
-				(None, None)
-			}
-		} else {
-			(None, None)
-		};
-
-		Some(OrgTimestamp {
-			year,
-			month,
-			day,
-			hour,
-			minute,
-			day_name,
-			raw: text.to_string(),
-		})
-	}
-}
-
-impl OrgTimestamp {
-	pub fn to_date_string(&self) -> String {
-		format!("{:04}-{:02}-{:02}", self.year, self.month, self.day)
-	}
-
-	pub fn to_datetime_string(&self) -> String {
-		if let (Some(hour), Some(minute)) = (self.hour, self.minute) {
-			format!("{} {:02}:{:02}", self.to_date_string(), hour, minute)
-		} else {
-			self.to_date_string()
-		}
-	}
-}
-
-impl OrgClockEntry {
-	pub fn parse_duration_minutes(&self) -> Option<u32> {
-		self.duration.as_ref().and_then(|d| {
-			let parts: Vec<&str> = d.trim().split(':').collect();
-			if parts.len() == 2 {
-				let hours = parts[0].parse::<u32>().ok()?;
-				let minutes = parts[1].parse::<u32>().ok()?;
-				Some(hours * 60 + minutes)
-			} else {
-				None
-			}
-		})
-	}
-
-	pub fn format_duration(&self) -> String {
-		if let Some(duration) = &self.duration {
-			format!(
-				"{} ({})",
-				duration,
-				if let Some(mins) = self.parse_duration_minutes() {
-					format!("{} minutes", mins)
-				} else {
-					"duration".to_string()
-				}
-			)
-		} else {
-			"running".to_string()
-		}
-	}
-}
-
-impl OrgLogbook {
-	pub fn total_minutes(&self) -> u32 {
-		self.clock_entries
-			.iter()
-			.filter_map(|entry| entry.parse_duration_minutes())
-			.sum()
-	}
-
-	pub fn format_total_time(&self) -> String {
-		let total_mins = self.total_minutes();
-		let hours = total_mins / 60;
-		let minutes = total_mins % 60;
-		format!("{}h {}m", hours, minutes)
-	}
-}
-
-fn print_time_summary(notes: &[OrgNote]) {
-	let mut total_tracked_minutes = 0;
-	let mut completed_tasks = 0;
-	let mut active_tasks = 0;
-	let mut scheduled_tasks = 0;
-	let mut overdue_tasks = 0;
-
-	collect_time_stats(
-		notes,
-		&mut total_tracked_minutes,
-		&mut completed_tasks,
-		&mut active_tasks,
-		&mut scheduled_tasks,
-		&mut overdue_tasks,
-	);
-
-	println!("Time Tracking Summary:");
-	println!("---------------------");
-	println!(
-		"Total tracked time: {}h {}m",
-		total_tracked_minutes / 60,
-		total_tracked_minutes % 60
-	);
-	println!("Completed tasks: {}", completed_tasks);
-	println!("Active tasks: {}", active_tasks);
-	println!("Scheduled tasks: {}", scheduled_tasks);
-	if overdue_tasks > 0 {
-		println!("⚠️  Overdue tasks: {}", overdue_tasks);
-	}
-	println!();
-}
-
-fn collect_time_stats(
-	notes: &[OrgNote],
-	total_minutes: &mut u32,
-	completed: &mut u32,
-	active: &mut u32,
-	scheduled: &mut u32,
-	overdue: &mut u32,
-) {
-	for note in notes {
-		if let Some(logbook) = &note.logbook {
-			*total_minutes += logbook.total_minutes();
-		}
-
-		match &note.status {
-			Some(status) if status == "DONE" => *completed += 1,
-			Some(status) if status == "TODO" || status == "IN-PROGRESS" => *active += 1,
-			_ => {},
-		}
-
-		if let Some(planning) = &note.planning {
-			if planning.scheduled.is_some() {
-				*scheduled += 1;
-			}
-
-			// Simple overdue check (tasks with deadlines in the past)
-			if let Some(deadline) = &planning.deadline {
-				if deadline.year < 2024 || (deadline.year == 2024 && deadline.month < 12) {
-					*overdue += 1;
-				}
-			}
-		}
-
-		collect_time_stats(
-			&note.children,
-			total_minutes,
-			completed,
-			active,
-			scheduled,
-			overdue,
-		);
-	}
-}
-
-#[derive(Clone)]
-enum Focus {
-	Left,
-	Right,
-}
-
-#[derive(Clone, PartialEq)]
-enum EditMode {
-	None,
-	Status,
-	Title,
-	Labels,
-	Content,
-	Scheduled,
-	Deadline,
-	Closed,
-}
-
-struct App {
-	notes: Vec<OrgNote>,
-	flat_notes: Vec<(usize, String)>, // (index in notes tree, display string)
-	selected_note_idx: usize,
-	selected_field_idx: usize,
-	focus: Focus,
-	edit_mode: EditMode,
-	edit_buffer: String,
-	list_state: ListState,
-	file_path: String,
-	modified: bool,
-	status_message: String,
-}
-
-impl App {
-	fn new(notes: Vec<OrgNote>, file_path: String) -> Self {
-		let flat_notes = Self::flatten_notes(&notes);
-		let mut list_state = ListState::default();
-		if !flat_notes.is_empty() {
-			list_state.select(Some(0));
-		}
-
-		Self {
-			notes,
-			flat_notes,
-			selected_note_idx: 0,
-			selected_field_idx: 0,
-			focus: Focus::Left,
-			edit_mode: EditMode::None,
-			edit_buffer: String::new(),
-			list_state,
-			file_path,
-			modified: false,
-			status_message: "Press Tab to switch panels, Enter to edit, q to quit".to_string(),
-		}
-	}
-
-	fn flatten_notes(notes: &[OrgNote]) -> Vec<(usize, String)> {
-		let mut flat = Vec::new();
-		Self::flatten_recursive(notes, &mut flat, 0);
-		flat
-	}
-
-	fn flatten_recursive(notes: &[OrgNote], flat: &mut Vec<(usize, String)>, depth: usize) {
-		for (_idx, note) in notes.iter().enumerate() {
-			let indent = "  ".repeat(depth);
-			let status = if let Some(s) = &note.status {
-				format!("{} ", s)
-			} else {
-				String::new()
-			};
-			let display = format!(
-				"{}{}*{} {}{}",
-				indent,
-				if depth > 0 { "" } else { "" },
-				"*".repeat(note.level.saturating_sub(depth)),
-				status,
-				note.title
-			);
-			let flat_idx = flat.len(); // Use sequential index instead of tree index
-			flat.push((flat_idx, display));
-			Self::flatten_recursive(&note.children, flat, depth + 1);
-		}
-	}
-
-	fn get_selected_note(&self) -> Option<&OrgNote> {
-		if self.flat_notes.is_empty() {
-			return None;
-		}
-
-		Self::find_note_by_flat_index(&self.notes, self.selected_note_idx, &mut 0)
-	}
-
-	fn get_selected_note_mut(&mut self) -> Option<&mut OrgNote> {
-		if self.flat_notes.is_empty() {
-			return None;
-		}
-
-		let target_idx = self.selected_note_idx;
-		Self::find_note_by_flat_index_mut(&mut self.notes, target_idx, &mut 0)
-	}
-
-	fn find_note_by_flat_index<'a>(
-		notes: &'a [OrgNote],
-		target_idx: usize,
-		current_idx: &mut usize,
-	) -> Option<&'a OrgNote> {
-		for note in notes.iter() {
-			if *current_idx == target_idx {
-				return Some(note);
-			}
-			*current_idx += 1;
-
-			if let Some(found) =
-				Self::find_note_by_flat_index(&note.children, target_idx, current_idx)
-			{
-				return Some(found);
-			}
-		}
-		None
-	}
-
-	fn find_note_by_flat_index_mut<'a>(
-		notes: &'a mut [OrgNote],
-		target_idx: usize,
-		current_idx: &mut usize,
-	) -> Option<&'a mut OrgNote> {
-		for note in notes.iter_mut() {
-			if *current_idx == target_idx {
-				return Some(note);
-			}
-			*current_idx += 1;
-
-			if let Some(found) =
-				Self::find_note_by_flat_index_mut(&mut note.children, target_idx, current_idx)
-			{
-				return Some(found);
-			}
-		}
-		None
-	}
-
-	fn add_note(&mut self) {
-		let new_note = OrgNote::new(1, "New Note".to_string());
-		self.notes.push(new_note);
-		self.flat_notes = Self::flatten_notes(&self.notes);
-		self.selected_note_idx = self.flat_notes.len() - 1;
-		self.list_state.select(Some(self.selected_note_idx));
-		self.modified = true;
-	}
-
-	fn delete_selected_note(&mut self) {
-		if !self.flat_notes.is_empty() {
-			// Find and remove the note from the tree structure
-			Self::remove_note_by_flat_index(&mut self.notes, self.selected_note_idx, &mut 0);
-			self.flat_notes = Self::flatten_notes(&self.notes);
-
-			if self.selected_note_idx >= self.flat_notes.len() && !self.flat_notes.is_empty() {
-				self.selected_note_idx = self.flat_notes.len() - 1;
-			}
-
-			if self.flat_notes.is_empty() {
-				self.list_state.select(None);
-			} else {
-				self.list_state.select(Some(self.selected_note_idx));
-			}
-
-			self.modified = true;
-		}
-	}
-
-	fn remove_note_by_flat_index(
-		notes: &mut Vec<OrgNote>,
-		target_idx: usize,
-		current_idx: &mut usize,
-	) -> bool {
-		let mut i = 0;
-		while i < notes.len() {
-			if *current_idx == target_idx {
-				notes.remove(i);
-				return true;
-			}
-			*current_idx += 1;
-
-			if Self::remove_note_by_flat_index(&mut notes[i].children, target_idx, current_idx) {
-				return true;
-			}
-			i += 1;
-		}
-		false
-	}
-
-	fn clock_in(&mut self) {
-		if let Some(note) = self.get_selected_note_mut() {
-			let now = Local::now();
-			let timestamp = OrgTimestamp {
-				year: now.year() as u32,
-				month: now.month(),
-				day: now.day(),
-				hour: Some(now.hour()),
-				minute: Some(now.minute()),
-				day_name: Some(now.format("%a").to_string()),
-				raw: now.format("[%Y-%m-%d %a %H:%M]").to_string(),
-			};
-
-			let clock_entry = OrgClockEntry {
-				start: timestamp,
-				end: None,
-				duration: None,
-				raw: now.format("CLOCK: [%Y-%m-%d %a %H:%M]").to_string(),
-			};
-
-			if let Some(logbook) = &mut note.logbook {
-				logbook.clock_entries.push(clock_entry);
-			} else {
-				note.logbook = Some(OrgLogbook {
-					clock_entries: vec![clock_entry],
-					raw_content: Vec::new(),
-				});
-			}
-
-			self.modified = true;
-		}
-	}
-
-	fn clock_out(&mut self) {
-		if let Some(note) = self.get_selected_note_mut() {
-			if let Some(logbook) = &mut note.logbook {
-				// Find the oldest running clock entry
-				for entry in &mut logbook.clock_entries {
-					if entry.end.is_none() {
-						let now = Local::now();
-						let end_timestamp = OrgTimestamp {
-							year: now.year() as u32,
-							month: now.month(),
-							day: now.day(),
-							hour: Some(now.hour()),
-							minute: Some(now.minute()),
-							day_name: Some(now.format("%a").to_string()),
-							raw: now.format("[%Y-%m-%d %a %H:%M]").to_string(),
-						};
-
-						entry.end = Some(end_timestamp);
-						// Calculate duration (simplified)
-						let start_time =
-							entry.start.hour.unwrap_or(0) * 60 + entry.start.minute.unwrap_or(0);
-						let end_time = now.hour() * 60 + now.minute();
-						let duration_mins = if end_time >= start_time {
-							end_time - start_time
-						} else {
-							(24 * 60) - start_time + end_time
-						};
-
-						entry.duration =
-							Some(format!("{}:{:02}", duration_mins / 60, duration_mins % 60));
-						entry.raw = format!(
-							"{}--{} =>  {}",
-							entry.start.raw,
-							now.format("[%Y-%m-%d %a %H:%M]"),
-							entry.duration.as_ref().unwrap()
-						);
-
-						self.modified = true;
-						break;
-					}
-				}
-			}
-		}
-	}
-
-	fn set_current_time(&mut self, field: &str) {
-		if let Some(note) = self.get_selected_note_mut() {
-			let now = Local::now();
-			let timestamp = OrgTimestamp {
-				year: now.year() as u32,
-				month: now.month(),
-				day: now.day(),
-				hour: Some(now.hour()),
-				minute: Some(now.minute()),
-				day_name: Some(now.format("%a").to_string()),
-				raw: format!(
-					"<{}-{:02}-{:02} {} {:02}:{:02}>",
-					now.year(),
-					now.month(),
-					now.day(),
-					now.format("%a"),
-					now.hour(),
-					now.minute(),
-				),
-			};
-
-			if note.planning.is_none() {
-				note.planning = Some(OrgPlanning {
-					scheduled: None,
-					deadline: None,
-					closed: None,
-				});
-			}
-
-			if let Some(planning) = &mut note.planning {
-				match field {
-					"scheduled" => planning.scheduled = Some(timestamp),
-					"deadline" => planning.deadline = Some(timestamp),
-					"closed" => planning.closed = Some(timestamp),
-					_ => {},
-				}
-			}
-
-			self.modified = true;
-		}
-	}
-
-	fn save_to_file(&self) -> io::Result<()> {
-		let content = self.serialize_to_org_format();
-		fs::write(&self.file_path, content)
-	}
-
-	fn serialize_to_org_format(&self) -> String {
-		let mut output = String::new();
-
-		for note in &self.notes {
-			Self::serialize_note(&mut output, note);
-		}
-
-		output
-	}
-
-	fn serialize_note(output: &mut String, note: &OrgNote) {
-		// Write heading
-		let stars = "*".repeat(note.level);
-		let status = if let Some(s) = &note.status {
-			format!(" {}", s)
-		} else {
-			String::new()
-		};
-		let labels = if !note.labels.is_empty() {
-			format!(" :{}:", note.labels.join(":"))
-		} else {
-			String::new()
-		};
-
-		output.push_str(&format!("{}{} {}{}\n", stars, status, note.title, labels));
-
-		// Write planning
-		if let Some(planning) = &note.planning {
-			if let Some(scheduled) = &planning.scheduled {
-				output.push_str(&format!("SCHEDULED: {}\n", scheduled.raw));
-			}
-			if let Some(deadline) = &planning.deadline {
-				output.push_str(&format!("DEADLINE: {}\n", deadline.raw));
-			}
-			if let Some(closed) = &planning.closed {
-				output.push_str(&format!("CLOSED: {}\n", closed.raw));
-			}
-		}
-
-		// Write logbook
-		if let Some(logbook) = &note.logbook {
-			if !logbook.clock_entries.is_empty() {
-				output.push_str(":LOGBOOK:\n");
-				for entry in &logbook.clock_entries {
-					output.push_str(&format!("{}\n", entry.raw));
-				}
-				output.push_str(":END:\n");
-			}
-		}
-
-		// Write content
-		if !note.content.trim().is_empty() {
-			output.push_str(&format!("{}\n", note.content));
-		}
-
-		output.push('\n');
-
-		// Write children
-		for child in &note.children {
-			Self::serialize_note(output, child);
-		}
-	}
-}
-
-fn run_tui(notes: Vec<OrgNote>, file_path: String) -> Result<(), Box<dyn std::error::Error>> {
-	// Setup terminal
-	enable_raw_mode().map_err(|e| format!("Failed to enable raw mode: {}", e))?;
-	let mut stdout = io::stdout();
-	execute!(stdout, EnterAlternateScreen, EnableMouseCapture)
-		.map_err(|e| format!("Failed to setup terminal: {}", e))?;
-
-	let backend = CrosstermBackend::new(stdout);
-	let mut terminal =
-		Terminal::new(backend).map_err(|e| format!("Failed to create terminal: {}", e))?;
-
-	let mut app = App::new(notes, file_path);
-	let res = run_app(&mut terminal, &mut app);
-
-	// Cleanup terminal
-	let _ = disable_raw_mode();
-	let _ = execute!(
-		terminal.backend_mut(),
-		LeaveAlternateScreen,
-		DisableMouseCapture
-	);
-	let _ = terminal.show_cursor();
-
-	Ok(res?)
-}
-
-fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> io::Result<()> {
-	loop {
-		terminal.draw(|f| ui(f, app))?;
-
-		match event::read() {
-			Ok(Event::Key(key)) => {
-				match app.edit_mode {
-					EditMode::None => {
-						match (key.code, key.modifiers) {
-							(KeyCode::Char('q'), KeyModifiers::NONE) => return Ok(()),
-							(KeyCode::Tab, KeyModifiers::NONE) => {
-								app.focus = match app.focus {
-									Focus::Left => Focus::Right,
-									Focus::Right => Focus::Left,
-								};
-							},
-							(KeyCode::Char('s'), KeyModifiers::CONTROL) => {
-								if let Err(_) = app.save_to_file() {
-									// Handle save error
-								} else {
-									app.modified = false;
-								}
-							},
-							(KeyCode::Char('n'), KeyModifiers::NONE) => {
-								app.add_note();
-							},
-							(KeyCode::Delete, KeyModifiers::NONE) => {
-								app.delete_selected_note();
-							},
-							(KeyCode::Char('i'), KeyModifiers::NONE) => {
-								app.clock_in();
-							},
-							(KeyCode::Char('o'), KeyModifiers::NONE) => {
-								app.clock_out();
-							},
-							(KeyCode::Char('k'), KeyModifiers::NONE) => {
-								app.set_current_time("scheduled");
-							},
-							(KeyCode::Char('l'), KeyModifiers::NONE) => {
-								app.set_current_time("deadline");
-							},
-							(KeyCode::Char('='), KeyModifiers::NONE) => {
-								match app.focus {
-									Focus::Right => {
-										// Set current time for selected field
-										// Implementation depends on selected field
-									},
-									_ => {},
-								}
-							},
-							_ => match app.focus {
-								Focus::Left => handle_left_panel_input(app, key.code),
-								Focus::Right => handle_right_panel_input(app, key.code),
-							},
-						}
-					},
-					_ => match key.code {
-						KeyCode::Enter => {
-							if matches!(app.edit_mode, EditMode::Content) {
-								app.edit_buffer.push('\n');
-							} else {
-								commit_edit(app);
-							}
-						},
-						KeyCode::Esc => {
-							commit_edit(app);
-						},
-						KeyCode::Char(c) => {
-							app.edit_buffer.push(c);
-						},
-						KeyCode::Backspace => {
-							app.edit_buffer.pop();
-						},
-						_ => {},
-					},
-				}
-			},
-			Ok(_) => {}, // Ignore other events
-			Err(e) => return Err(e),
-		}
-	}
-}
-
-fn handle_left_panel_input(app: &mut App, key: KeyCode) {
-	match key {
-		KeyCode::Up => {
-			if app.selected_note_idx > 0 {
-				app.selected_note_idx -= 1;
-				app.list_state.select(Some(app.selected_note_idx));
-				app.selected_field_idx = 0;
-				app.status_message = get_field_name_at_index(app, app.selected_field_idx);
-			}
-		},
-		KeyCode::Down => {
-			if app.selected_note_idx < app.flat_notes.len().saturating_sub(1) {
-				app.selected_note_idx += 1;
-				app.list_state.select(Some(app.selected_note_idx));
-				app.selected_field_idx = 0;
-				app.status_message = get_field_name_at_index(app, app.selected_field_idx);
-			}
-		},
-		_ => {},
-	}
-}
-
-fn handle_right_panel_input(app: &mut App, key: KeyCode) {
-	match key {
-		KeyCode::Up => {
-			if app.selected_field_idx > 0 {
-				app.selected_field_idx -= 1;
-				app.status_message = get_field_name_at_index(app, app.selected_field_idx);
-			}
-		},
-		KeyCode::Down => {
-			let max_fields = count_visible_fields(app);
-			if app.selected_field_idx < max_fields.saturating_sub(1) {
-				app.selected_field_idx += 1;
-				app.status_message = get_field_name_at_index(app, app.selected_field_idx);
-			}
-		},
-		KeyCode::Enter => {
-			start_editing(app);
-		},
-		_ => {},
-	}
-}
-
-fn count_visible_fields(app: &App) -> usize {
-	let mut count = 0;
-	if let Some(note) = app.get_selected_note() {
-		if note.status.is_some() {
-			count += 1;
-		}
-		count += 1; // title always visible
-		if !note.labels.is_empty() {
-			count += 1;
-		}
-		if let Some(planning) = &note.planning {
-			if planning.scheduled.is_some() {
-				count += 1;
-			}
-			if planning.deadline.is_some() {
-				count += 1;
-			}
-			if planning.closed.is_some() {
-				count += 1;
-			}
-		}
-		if let Some(logbook) = &note.logbook {
-			count += logbook.clock_entries.len();
-		}
-		count += 1; // content always visible
-	}
-	count
-}
-
-fn get_field_name_at_index(app: &App, field_idx: usize) -> String {
-	if let Some(note) = app.get_selected_note() {
-		let mut current_idx = 0;
-
-		if let Some(status) = &note.status {
-			if current_idx == field_idx {
-				return format!("Status: {}", status);
-			}
-			current_idx += 1;
-		}
-
-		if current_idx == field_idx {
-			return format!("Title: {}", note.title);
-		}
-		current_idx += 1;
-
-		if !note.labels.is_empty() {
-			if current_idx == field_idx {
-				return format!("Labels: :{}:", note.labels.join(":"));
-			}
-			current_idx += 1;
-		}
-
-		if let Some(planning) = &note.planning {
-			if let Some(scheduled) = &planning.scheduled {
-				if current_idx == field_idx {
-					return format!("Scheduled: {}", scheduled.raw);
-				}
-				current_idx += 1;
-			}
-			if let Some(deadline) = &planning.deadline {
-				if current_idx == field_idx {
-					return format!("Deadline: {}", deadline.raw);
-				}
-				current_idx += 1;
-			}
-			if let Some(closed) = &planning.closed {
-				if current_idx == field_idx {
-					return format!("Closed: {}", closed.raw);
-				}
-				current_idx += 1;
-			}
-		}
-
-		if let Some(logbook) = &note.logbook {
-			for (i, entry) in logbook.clock_entries.iter().enumerate() {
-				if current_idx == field_idx {
-					let duration_text = if let Some(duration) = &entry.duration {
-						format!(" => {}", duration)
-					} else {
-						" (running)".to_string()
-					};
-					return format!(
-						"Clock {}: {}{}",
-						i + 1,
-						entry.start.to_datetime_string(),
-						duration_text
-					);
-				}
-				current_idx += 1;
-			}
-		}
-
-		if current_idx == field_idx {
-			return "Content".to_string();
-		}
-	}
-	"Unknown field".to_string()
-}
-
-fn start_editing(app: &mut App) {
-	let selected_field_idx = app.selected_field_idx;
-
-	// Clone the data we need to avoid borrowing conflicts
-	let (status, title, labels, content, planning, logbook) =
-		if let Some(note) = app.get_selected_note() {
-			(
-				note.status.clone(),
-				note.title.clone(),
-				note.labels.clone(),
-				note.content.clone(),
-				note.planning.clone(),
-				note.logbook.clone(),
-			)
-		} else {
-			return;
-		};
-
-	let mut field_idx = 0;
-
-	if let Some(status_val) = status {
-		if field_idx == selected_field_idx {
-			app.edit_mode = EditMode::Status;
-			app.edit_buffer = status_val;
-			app.status_message = "Editing Status - Press Enter to save, Esc to cancel".to_string();
-			return;
-		}
-		field_idx += 1;
-	}
-
-	if field_idx == selected_field_idx {
-		app.edit_mode = EditMode::Title;
-		app.edit_buffer = title;
-		app.status_message = "Editing Title - Press Enter to save, Esc to cancel".to_string();
-		return;
-	}
-	field_idx += 1;
-
-	if !labels.is_empty() {
-		if field_idx == selected_field_idx {
-			app.edit_mode = EditMode::Labels;
-			app.edit_buffer = format!(":{}:", labels.join(":"));
-			app.status_message = "Editing Labels - Press Enter to save, Esc to cancel".to_string();
-			return;
-		}
-		field_idx += 1;
-	}
-
-	// Add planning fields
-	if let Some(planning_data) = planning {
-		if let Some(scheduled) = &planning_data.scheduled {
-			if field_idx == selected_field_idx {
-				app.edit_mode = EditMode::Scheduled;
-				app.edit_buffer = scheduled.raw.clone();
-				app.status_message =
-					"Editing Scheduled - Press Enter to save, Esc to cancel".to_string();
-				return;
-			}
-			field_idx += 1;
-		}
-		if let Some(deadline) = &planning_data.deadline {
-			if field_idx == selected_field_idx {
-				app.edit_mode = EditMode::Deadline;
-				app.edit_buffer = deadline.raw.clone();
-				app.status_message =
-					"Editing Deadline - Press Enter to save, Esc to cancel".to_string();
-				return;
-			}
-			field_idx += 1;
-		}
-		if let Some(closed) = &planning_data.closed {
-			if field_idx == selected_field_idx {
-				app.edit_mode = EditMode::Closed;
-				app.edit_buffer = closed.raw.clone();
-				app.status_message =
-					"Editing Closed - Press Enter to save, Esc to cancel".to_string();
-				return;
-			}
-			field_idx += 1;
-		}
-	}
-
-	// Add logbook fields (clock entries)
-	if let Some(logbook_data) = logbook {
-		for (i, entry) in logbook_data.clock_entries.iter().enumerate() {
-			if field_idx == selected_field_idx {
-				app.edit_mode = EditMode::Content; // Reuse content mode for clock entries
-				app.edit_buffer = entry.raw.clone();
-				app.status_message = format!(
-					"Editing Clock Entry {} - Press Esc to save, Enter for new line",
-					i + 1
-				);
-				return;
-			}
-			field_idx += 1;
-		}
-	}
-
-	if field_idx == selected_field_idx {
-		app.edit_mode = EditMode::Content;
-		app.edit_buffer = content;
-		app.status_message = "Editing Content - Press Enter to save, Esc to cancel".to_string();
-	}
-}
-
-fn commit_edit(app: &mut App) {
-	let edit_mode = app.edit_mode.clone();
-	let edit_buffer = app.edit_buffer.clone();
-
-	// Parse timestamps outside the mutable borrow
-	let scheduled_timestamp = if matches!(edit_mode, EditMode::Scheduled) {
-		parse_timestamp_from_text(&edit_buffer)
-	} else {
-		None
-	};
-	let deadline_timestamp = if matches!(edit_mode, EditMode::Deadline) {
-		parse_timestamp_from_text(&edit_buffer)
-	} else {
-		None
-	};
-	let closed_timestamp = if matches!(edit_mode, EditMode::Closed) {
-		parse_timestamp_from_text(&edit_buffer)
-	} else {
-		None
-	};
-
-	if let Some(note) = app.get_selected_note_mut() {
-		match edit_mode {
-			EditMode::Status => {
-				note.status = if edit_buffer.is_empty() {
-					None
-				} else {
-					Some(edit_buffer)
-				};
-			},
-			EditMode::Title => {
-				note.title = edit_buffer;
-			},
-			EditMode::Labels => {
-				let labels_str = edit_buffer.trim_start_matches(':').trim_end_matches(':');
-				note.labels = if labels_str.is_empty() {
-					Vec::new()
-				} else {
-					labels_str.split(':').map(|s| s.to_string()).collect()
-				};
-			},
-			EditMode::Scheduled => {
-				if let Some(timestamp) = scheduled_timestamp {
-					if note.planning.is_none() {
-						note.planning = Some(OrgPlanning {
-							scheduled: None,
-							deadline: None,
-							closed: None,
-						});
-					}
-					if let Some(planning) = &mut note.planning {
-						planning.scheduled = Some(timestamp);
-					}
-				}
-			},
-			EditMode::Deadline => {
-				if let Some(timestamp) = deadline_timestamp {
-					if note.planning.is_none() {
-						note.planning = Some(OrgPlanning {
-							scheduled: None,
-							deadline: None,
-							closed: None,
-						});
-					}
-					if let Some(planning) = &mut note.planning {
-						planning.deadline = Some(timestamp);
-					}
-				}
-			},
-			EditMode::Closed => {
-				if let Some(timestamp) = closed_timestamp {
-					if note.planning.is_none() {
-						note.planning = Some(OrgPlanning {
-							scheduled: None,
-							deadline: None,
-							closed: None,
-						});
-					}
-					if let Some(planning) = &mut note.planning {
-						planning.closed = Some(timestamp);
-					}
-				}
-			},
-			EditMode::Content => {
-				note.content = edit_buffer;
-			},
-			_ => {},
-		}
-
-		app.modified = true;
-		app.flat_notes = App::flatten_notes(&app.notes);
-	}
-
-	app.edit_mode = EditMode::None;
-	app.edit_buffer.clear();
-	app.status_message = get_field_name_at_index(app, app.selected_field_idx);
-}
-
-fn parse_timestamp_from_text(text: &str) -> Option<OrgTimestamp> {
-	let parser = OrgParser::new("");
-	parser.parse_timestamp_from_text(text)
-}
-
-fn ui(f: &mut Frame, app: &App) {
-	let chunks = Layout::default()
-		.direction(Direction::Vertical)
-		.constraints([Constraint::Min(0), Constraint::Length(3)])
-		.split(f.size());
-
-	let main_chunks = Layout::default()
-		.direction(Direction::Horizontal)
-		.constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
-		.split(chunks[0]);
-
-	render_left_panel(f, app, main_chunks[0]);
-	render_right_panel(f, app, main_chunks[1]);
-	render_status_bar(f, app, chunks[1]);
-}
-
-fn render_left_panel(f: &mut Frame, app: &App, area: Rect) {
-	let items: Vec<ListItem> = app
-		.flat_notes
-		.iter()
-		.map(|(_, display)| ListItem::new(Line::from(display.clone())))
-		.collect();
-
-	let border_style = if matches!(app.focus, Focus::Left) {
-		Style::default().fg(Color::Yellow)
-	} else {
-		Style::default()
-	};
-
-	let list = List::new(items)
-		.block(
-			Block::default()
-				.borders(Borders::ALL)
-				.title("Notes")
-				.border_style(border_style),
-		)
-		.highlight_style(Style::default().add_modifier(Modifier::REVERSED));
-
-	f.render_stateful_widget(list, area, &mut app.list_state.clone());
-}
-
-fn render_right_panel(f: &mut Frame, app: &App, area: Rect) {
-	let chunks = Layout::default()
-		.direction(Direction::Vertical)
-		.constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
-		.split(area);
-
-	render_metadata_panel(f, app, chunks[0]);
-	render_content_panel(f, app, chunks[1]);
-}
-
-fn render_metadata_panel(f: &mut Frame, app: &App, area: Rect) {
-	let border_style = if matches!(app.focus, Focus::Right) {
-		Style::default().fg(Color::Yellow)
-	} else {
-		Style::default()
-	};
-
-	if let Some(note) = app.get_selected_note() {
-		let mut lines = Vec::new();
-		let mut field_idx = 0;
-
-		if let Some(status) = &note.status {
-			let style = if field_idx == app.selected_field_idx && matches!(app.focus, Focus::Right)
-			{
-				Style::default().add_modifier(Modifier::BOLD)
-			} else {
-				Style::default()
-			};
-
-			let text = if matches!(app.edit_mode, EditMode::Status) {
-				format!("Status: {}", app.edit_buffer)
-			} else {
-				format!("Status: {}", status)
-			};
-
-			lines.push(Line::from(Span::styled(text, style)));
-			field_idx += 1;
-		}
-
-		let style = if field_idx == app.selected_field_idx && matches!(app.focus, Focus::Right) {
-			Style::default().add_modifier(Modifier::BOLD)
-		} else {
-			Style::default()
-		};
-
-		let text = if matches!(app.edit_mode, EditMode::Title) {
-			format!("Title: {}", app.edit_buffer)
-		} else {
-			format!("Title: {}", note.title)
-		};
-
-		lines.push(Line::from(Span::styled(text, style)));
-		field_idx += 1;
-
-		if !note.labels.is_empty() {
-			let style = if field_idx == app.selected_field_idx && matches!(app.focus, Focus::Right)
-			{
-				Style::default().add_modifier(Modifier::BOLD)
-			} else {
-				Style::default()
-			};
-
-			let text = if matches!(app.edit_mode, EditMode::Labels) {
-				format!("Labels: {}", app.edit_buffer)
-			} else {
-				format!("Labels: :{}:", note.labels.join(":"))
-			};
-
-			lines.push(Line::from(Span::styled(text, style)));
-			field_idx += 1;
-		}
-
-		if let Some(planning) = &note.planning {
-			if let Some(scheduled) = &planning.scheduled {
-				let style =
-					if field_idx == app.selected_field_idx && matches!(app.focus, Focus::Right) {
-						Style::default().add_modifier(Modifier::BOLD)
-					} else {
-						Style::default()
-					};
-
-				let text = if matches!(app.edit_mode, EditMode::Scheduled) {
-					format!("Scheduled: {}", app.edit_buffer)
-				} else {
-					format!("Scheduled: {}", scheduled.raw)
-				};
-
-				lines.push(Line::from(Span::styled(text, style)));
-				field_idx += 1;
-			}
-			if let Some(deadline) = &planning.deadline {
-				let style =
-					if field_idx == app.selected_field_idx && matches!(app.focus, Focus::Right) {
-						Style::default().add_modifier(Modifier::BOLD)
-					} else {
-						Style::default()
-					};
-
-				let text = if matches!(app.edit_mode, EditMode::Deadline) {
-					format!("Deadline: {}", app.edit_buffer)
-				} else {
-					format!("Deadline: {}", deadline.raw)
-				};
-
-				lines.push(Line::from(Span::styled(text, style)));
-				field_idx += 1;
-			}
-			if let Some(closed) = &planning.closed {
-				let style =
-					if field_idx == app.selected_field_idx && matches!(app.focus, Focus::Right) {
-						Style::default().add_modifier(Modifier::BOLD)
-					} else {
-						Style::default()
-					};
-
-				let text = if matches!(app.edit_mode, EditMode::Closed) {
-					format!("Closed: {}", app.edit_buffer)
-				} else {
-					format!("Closed: {}", closed.raw)
-				};
-
-				lines.push(Line::from(Span::styled(text, style)));
-				field_idx += 1;
-			}
-		}
-
-		if let Some(logbook) = &note.logbook {
-			if !logbook.clock_entries.is_empty() {
-				lines.push(Line::from("Time Tracking:"));
-				for entry in &logbook.clock_entries {
-					let style = if field_idx == app.selected_field_idx
-						&& matches!(app.focus, Focus::Right)
-					{
-						Style::default().add_modifier(Modifier::BOLD)
-					} else {
-						Style::default()
-					};
-
-					let duration_text = if let Some(duration) = &entry.duration {
-						format!(" => {}", duration)
-					} else {
-						" (running)".to_string()
-					};
-
-					lines.push(Line::from(Span::styled(
-						format!(
-							"  Clock: {}{}",
-							entry.start.to_datetime_string(),
-							duration_text
-						),
-						style,
-					)));
-					field_idx += 1;
-				}
-
-				let total = logbook.format_total_time();
-				lines.push(Line::from(format!("  Total: {}", total)));
-			}
-		}
-
-		let paragraph = Paragraph::new(lines)
-			.block(
-				Block::default()
-					.borders(Borders::ALL)
-					.title("Metadata")
-					.border_style(border_style),
-			)
-			.wrap(Wrap { trim: true });
-
-		f.render_widget(paragraph, area);
-	}
-}
-
-fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
-	let status_text = if app.edit_mode != EditMode::None {
-		format!(
-			"{}: {}",
-			match app.edit_mode {
-				EditMode::Status => "STATUS",
-				EditMode::Title => "TITLE",
-				EditMode::Labels => "LABELS",
-				EditMode::Scheduled => "SCHEDULED",
-				EditMode::Deadline => "DEADLINE",
-				EditMode::Closed => "CLOSED",
-				EditMode::Content => "CONTENT",
-				EditMode::None => "",
-			},
-			app.edit_buffer
-		)
-	} else {
-		app.status_message.clone()
-	};
-
-	let cursor_style = if app.edit_mode != EditMode::None {
-		Style::default().fg(Color::Black).bg(Color::White)
-	} else {
-		Style::default()
-	};
-
-	let paragraph = Paragraph::new(status_text)
-		.block(
-			Block::default()
-				.borders(Borders::ALL)
-				.title("Status")
-				.border_style(cursor_style),
-		)
-		.wrap(Wrap { trim: true });
-
-	f.render_widget(paragraph, area);
-
-	// Show cursor when editing non-content fields
-	if app.edit_mode != EditMode::None && !matches!(app.edit_mode, EditMode::Content) {
-		let prefix_len = match app.edit_mode {
-			EditMode::Status => 8,     // "STATUS: ".len()
-			EditMode::Title => 7,      // "TITLE: ".len()
-			EditMode::Labels => 8,     // "LABELS: ".len()
-			EditMode::Scheduled => 11, // "SCHEDULED: ".len()
-			EditMode::Deadline => 10,  // "DEADLINE: ".len()
-			EditMode::Closed => 8,     // "CLOSED: ".len()
-			_ => 0,
-		};
-		let cursor_x = area.x
-			+ 1 + prefix_len
-			+ (app.edit_buffer.len() as u16).min(area.width.saturating_sub(prefix_len + 3));
-		let cursor_y = area.y + 1;
-		f.set_cursor(cursor_x, cursor_y);
-	}
-}
-
-fn render_content_panel(f: &mut Frame, app: &App, area: Rect) {
-	let border_style = if matches!(app.focus, Focus::Right) {
-		Style::default().fg(Color::Yellow)
-	} else {
-		Style::default()
-	};
-
-	if let Some(note) = app.get_selected_note() {
-		let text = if matches!(app.edit_mode, EditMode::Content) {
-			app.edit_buffer.clone()
-		} else {
-			note.content.clone()
-		};
-
-		let paragraph = Paragraph::new(text)
-			.block(
-				Block::default()
-					.borders(Borders::ALL)
-					.title("Content")
-					.border_style(border_style),
-			)
-			.wrap(Wrap { trim: true });
-
-		f.render_widget(paragraph, area);
-
-		// Show cursor when editing content
-		if matches!(app.edit_mode, EditMode::Content) && matches!(app.focus, Focus::Right) {
-			let lines: Vec<&str> = app.edit_buffer.lines().collect();
-			let cursor_y = area.y + 1 + (lines.len() as u16).saturating_sub(1);
-			let cursor_x = if let Some(last_line) = lines.last() {
-				area.x + 1 + (last_line.len() as u16).min(area.width.saturating_sub(3))
-			} else {
-				area.x + 1
-			};
-			f.set_cursor(
-				cursor_x.min(area.x + area.width - 2),
-				cursor_y.min(area.y + area.height - 2),
-			);
-		}
-	}
+type Res<T = ()> = Result<T, String>;
+
+struct Ctx {
+	json: bool,
+	dry_run: bool,
+	expect: Option<String>,
+	today: NaiveDate,
+	now: NaiveDateTime,
 }
 
 fn main() {
-	let matches = Command::new("rorg")
-		.version("0.1.0")
-		.about("A Rust org-mode file parser")
-		.arg(
-			Arg::new("file")
-				.help("The org-mode file to parse")
-				.required(true)
-				.index(1),
-		)
-		.arg(
-			Arg::new("verbose")
-				.short('v')
-				.long("verbose")
-				.help("Enable verbose output")
-				.action(clap::ArgAction::SetTrue),
-		)
-		.arg(
-			Arg::new("format")
-				.short('f')
-				.long("format")
-				.help("Output format (yaml or json)")
-				.value_parser(["yaml", "json"])
-				.default_value("yaml"),
-		)
-		.arg(
-			Arg::new("summary")
-				.short('s')
-				.long("summary")
-				.help("Show time tracking summary statistics")
-				.action(clap::ArgAction::SetTrue),
-		)
-		.arg(
-			Arg::new("no-tui")
-				.long("no-tui")
-				.help("Disable TUI interface and use text output")
-				.action(clap::ArgAction::SetTrue),
-		)
-		.get_matches();
-
-	let file_path = matches.get_one::<String>("file").unwrap();
-	let verbose = matches.get_flag("verbose");
-	let format = matches.get_one::<String>("format").unwrap();
-	let show_summary = matches.get_flag("summary");
-	let use_tui = !matches.get_flag("no-tui");
-
-	if !Path::new(file_path).exists() {
-		eprintln!("Error: File '{}' does not exist", file_path);
+	let cli = Cli::parse();
+	let now = Local::now().naive_local();
+	let ctx = Ctx {
+		json: cli.json,
+		dry_run: cli.dry_run,
+		expect: cli.expect,
+		today: now.date(),
+		now,
+	};
+	if let Err(e) = run(cli.cmd, &ctx) {
+		eprintln!("error: {e}");
 		std::process::exit(1);
 	}
+}
 
-	let content = match fs::read_to_string(file_path) {
-		Ok(content) => content,
-		Err(err) => {
-			eprintln!("Error reading file '{}': {}", file_path, err);
-			std::process::exit(1);
+fn run(cmd: Cmd, ctx: &Ctx) -> Res {
+	match cmd {
+		Cmd::Info { paths } => cmd_info(&load_all(&paths)?),
+		Cmd::Outline {
+			paths,
+			depth,
+			under,
+		} => cmd_outline(&load_all(&paths)?, depth, under, ctx),
+		Cmd::Find(a) => cmd_find(a, ctx),
+		Cmd::Show {
+			file,
+			sel,
+			body,
+			raw,
+			subtree,
+			max_lines,
+			reveal,
+		} => cmd_show(
+			&Doc::load(&file)?,
+			&sel,
+			body,
+			raw,
+			subtree,
+			max_lines,
+			reveal,
+			ctx,
+		),
+		Cmd::Grep {
+			pattern,
+			paths,
+			case_sensitive,
+			limit,
+			reveal,
+		} => cmd_grep(
+			&load_all(&paths)?,
+			&pattern,
+			case_sensitive,
+			limit,
+			reveal,
+			ctx,
+		),
+		Cmd::Agenda { paths, range, all } => cmd_agenda(&load_all(&paths)?, &range, all, ctx),
+		Cmd::Clock { paths, range } => cmd_clock(&load_all(&paths)?, range.as_deref(), ctx),
+		Cmd::Status {
+			file,
+			sel,
+			keyword,
+			no_log,
+		} => write(&file, &sel, ctx, |d, i| {
+			let k = if keyword.eq_ignore_ascii_case("none") {
+				None
+			} else {
+				Some(d.keywords.canonical(&keyword).unwrap_or(keyword.clone()))
+			};
+			let out = d.set_keyword(i, k, !no_log, ctx.now)?;
+			if let StatusOutcome::Repeated = out {
+				eprintln!(
+					"note: repeating task — dates shifted, keyword kept (org repeater semantics)"
+				);
+			}
+			Ok(i)
+		}),
+		Cmd::Title { file, sel, text } => {
+			write(&file, &sel, ctx, |d, i| d.set_title(i, &text).map(|_| i))
 		},
+		Cmd::Tag {
+			file,
+			sel,
+			add,
+			rm,
+			set,
+		} => write(&file, &sel, ctx, |d, i| {
+			let mut tags = match &set {
+				Some(s) => s
+					.split([',', ':'])
+					.map(|t| t.trim().to_string())
+					.filter(|t| !t.is_empty())
+					.collect(),
+				None => d.headings[i].tags.clone(),
+			};
+			tags.retain(|t| !rm.contains(t));
+			for t in &add {
+				if !tags.contains(t) {
+					tags.push(t.clone());
+				}
+			}
+			d.set_tags(i, tags).map(|_| i)
+		}),
+		Cmd::Priority { file, sel, value } => write(&file, &sel, ctx, |d, i| {
+			let p = match value.as_str() {
+				"none" => None,
+				v if v.chars().count() == 1 && v.chars().all(|c| c.is_ascii_alphanumeric()) => {
+					v.chars().next().map(|c| c.to_ascii_uppercase())
+				},
+				v => return Err(format!("priority must be one letter or `none`, got '{v}'")),
+			};
+			d.set_priority(i, p).map(|_| i)
+		}),
+		Cmd::Schedule { file, sel, when } => {
+			write_planning(&file, &sel, PlanKind::Scheduled, &when, ctx)
+		},
+		Cmd::Deadline { file, sel, when } => {
+			write_planning(&file, &sel, PlanKind::Deadline, &when, ctx)
+		},
+		Cmd::Prop {
+			file,
+			sel,
+			key,
+			value,
+			unset,
+		} => write(&file, &sel, ctx, |d, i| {
+			match (unset, &value) {
+				(true, _) => d.set_property(i, &key, None)?,
+				(false, Some(v)) => d.set_property(i, &key, Some(v))?,
+				(false, None) => return Err("give a VALUE or --unset".into()),
+			}
+			Ok(i)
+		}),
+		Cmd::Body {
+			file,
+			sel,
+			append,
+			set,
+		} => write(&file, &sel, ctx, |d, i| {
+			match (&append, &set) {
+				(Some(t), _) => d.append_body(i, &stdin_or(t)?)?,
+				(_, Some(t)) => d.set_body(i, &stdin_or(t)?)?,
+				_ => unreachable!(),
+			}
+			Ok(i)
+		}),
+		Cmd::Add {
+			file,
+			pos,
+			title,
+			status,
+			tags,
+			priority,
+			scheduled,
+			deadline,
+			body,
+		} => {
+			let mut d = Doc::load(&file)?;
+			let pos = resolve_pos(&d, &pos)?;
+			let when = |w: &Option<String>| {
+				w.as_deref()
+					.map(|w| ts::parse_when(w, ctx.today, d.ru_days))
+					.transpose()
+			};
+			let body = body.as_deref().map(stdin_or).transpose()?;
+			let entry = NewEntry {
+				title: &title,
+				keyword: status.map(|k| d.keywords.canonical(&k).unwrap_or(k)),
+				priority: priority.map(|c| c.to_ascii_uppercase()),
+				tags,
+				scheduled: when(&scheduled)?,
+				deadline: when(&deadline)?,
+				body: body.as_deref(),
+			};
+			let i = d.add_heading(pos, entry)?;
+			finish_write(&d, Some(i), ctx)
+		},
+		Cmd::Delete { file, sel } => {
+			let mut d = Doc::load(&file)?;
+			let i = resolve_checked(&d, &sel, ctx)?;
+			let h = d.headings[i].clone();
+			let descendants = d
+				.headings
+				.iter()
+				.filter(|o| o.line > h.line && o.line < h.subtree_end)
+				.count();
+			let n = d.delete_subtree(i);
+			println!(
+				"deleted {} L{} '{}' with {descendants} descendant heading(s), {n} line(s)",
+				h.id(),
+				h.line + 1,
+				h.title
+			);
+			finish_write(&d, None, ctx)
+		},
+		Cmd::Move { file, sel, pos } => {
+			let mut d = Doc::load(&file)?;
+			let i = resolve_checked(&d, &sel, ctx)?;
+			let old = d.headings[i].id();
+			let pos = resolve_pos(&d, &pos)?;
+			let ni = d.move_subtree(i, pos)?;
+			println!("moved {old} -> {}", d.headings[ni].id());
+			finish_write(&d, Some(ni), ctx)
+		},
+	}
+}
+
+// ---------- loading ----------
+
+fn collect_org(p: &Path, out: &mut Vec<PathBuf>) -> Res {
+	if p.is_dir() {
+		let mut entries: Vec<PathBuf> = std::fs::read_dir(p)
+			.map_err(|e| format!("cannot read dir {}: {e}", p.display()))?
+			.filter_map(|e| e.ok().map(|e| e.path()))
+			.filter(|e| {
+				!e.file_name()
+					.is_some_and(|n| n.to_string_lossy().starts_with('.'))
+			})
+			.collect();
+		entries.sort();
+		for e in entries {
+			if e.is_dir() || (e.is_file() && e.extension().is_some_and(|x| x == "org")) {
+				collect_org(&e, out)?;
+			}
+		}
+		Ok(())
+	} else if p.exists() {
+		out.push(p.to_path_buf());
+		Ok(())
+	} else {
+		Err(format!("no such file: {}", p.display()))
+	}
+}
+
+fn load_all(paths: &[PathBuf]) -> Res<Vec<Doc>> {
+	let mut files = vec![];
+	for p in paths {
+		collect_org(p, &mut files)?;
+	}
+	files.iter().map(|f| Doc::load(f)).collect()
+}
+
+fn stdin_or(t: &str) -> Res<String> {
+	if t != "-" {
+		return Ok(t.to_string());
+	}
+	let mut s = String::new();
+	std::io::stdin()
+		.read_to_string(&mut s)
+		.map_err(|e| format!("stdin: {e}"))?;
+	Ok(s)
+}
+
+fn resolve_pos(d: &Doc, p: &PosArgs) -> Res<Pos> {
+	Ok(if let Some(s) = &p.under {
+		Pos::Under {
+			parent: d.resolve(s)?,
+			first: p.first,
+		}
+	} else if let Some(s) = &p.after {
+		Pos::After(d.resolve(s)?)
+	} else if let Some(s) = &p.before {
+		Pos::Before(d.resolve(s)?)
+	} else {
+		Pos::Top { first: p.first }
+	})
+}
+
+// ---------- output helpers ----------
+
+#[derive(Serialize)]
+struct HeadingOut {
+	file: String,
+	id: String,
+	line: usize,
+	level: usize,
+	keyword: Option<String>,
+	priority: Option<char>,
+	title: String,
+	tags: Vec<String>,
+	inherited_tags: Vec<String>,
+	scheduled: Option<String>,
+	deadline: Option<String>,
+	closed: Option<String>,
+	parents: Vec<String>,
+	children: usize,
+	protected: bool,
+}
+
+fn heading_out(d: &Doc, i: usize) -> HeadingOut {
+	let h = &d.headings[i];
+	HeadingOut {
+		file: d.path.display().to_string(),
+		id: h.id(),
+		line: h.line + 1,
+		level: h.level,
+		keyword: h.keyword.clone(),
+		priority: h.priority,
+		title: h.title.clone(),
+		tags: h.tags.clone(),
+		inherited_tags: d
+			.all_tags(i)
+			.into_iter()
+			.filter(|t| !h.tags.contains(t))
+			.collect(),
+		scheduled: h.planning.scheduled.as_ref().map(|t| t.raw.clone()),
+		deadline: h.planning.deadline.as_ref().map(|t| t.raw.clone()),
+		closed: h.planning.closed.as_ref().map(|t| t.raw.clone()),
+		parents: d.breadcrumb(i).into_iter().map(str::to_string).collect(),
+		children: h.children.len(),
+		protected: d.is_protected(i),
+	}
+}
+
+/// One compact line: `[file:]ID  L12  KW [#A] Title  :tags:  sched:… dl:… closed:…`
+fn heading_line(d: &Doc, i: usize, prefix: bool, crumbs: bool) -> String {
+	let h = &d.headings[i];
+	let mut s = String::new();
+	if prefix {
+		s.push_str(&format!("{}:", d.path.display()));
+	}
+	s.push_str(&format!("{}  L{}  ", h.id(), h.line + 1));
+	if let Some(k) = &h.keyword {
+		s.push_str(k);
+		s.push(' ');
+	}
+	if let Some(p) = h.priority {
+		s.push_str(&format!("[#{p}] "));
+	}
+	s.push_str(&h.title);
+	if !h.tags.is_empty() {
+		s.push_str(&format!("  :{}:", h.tags.join(":")));
+	}
+	for (label, t) in [
+		("sched", &h.planning.scheduled),
+		("dl", &h.planning.deadline),
+		("closed", &h.planning.closed),
+	] {
+		if let Some(t) = t {
+			s.push_str(&format!("  {label}:{}", t.short()));
+		}
+	}
+	if crumbs && h.parent.is_some() {
+		s.push_str(&format!("  (in: {})", d.breadcrumb(i).join(" > ")));
+	}
+	s
+}
+
+fn print_json(v: &impl Serialize) -> Res {
+	println!(
+		"{}",
+		serde_json::to_string_pretty(v).map_err(|e| e.to_string())?
+	);
+	Ok(())
+}
+
+fn truncate(s: &str, n: usize) -> String {
+	if s.chars().count() <= n {
+		s.to_string()
+	} else {
+		format!("{}…", s.chars().take(n).collect::<String>())
+	}
+}
+
+// ---------- read commands ----------
+
+fn cmd_info(docs: &[Doc]) -> Res {
+	for d in docs {
+		let max_depth = d.headings.iter().map(|h| h.level).max().unwrap_or(0);
+		println!(
+			"{}: {} lines, {} headings, max depth {max_depth}",
+			d.path.display(),
+			d.lines.len(),
+			d.headings.len()
+		);
+		println!(
+			"  keywords ({}): {}",
+			d.keywords.source,
+			d.keywords.describe()
+		);
+		let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+		let mut tags: BTreeMap<String, usize> = BTreeMap::new();
+		for h in &d.headings {
+			*counts
+				.entry(h.keyword.clone().unwrap_or_else(|| "(none)".into()))
+				.or_default() += 1;
+			for t in &h.tags {
+				*tags.entry(t.clone()).or_default() += 1;
+			}
+		}
+		let fmt = |m: &BTreeMap<String, usize>| {
+			m.iter()
+				.map(|(k, v)| format!("{k}={v}"))
+				.collect::<Vec<_>>()
+				.join(" ")
+		};
+		println!("  by keyword: {}", fmt(&counts));
+		if !d.filetags.is_empty() {
+			println!("  filetags: {}", d.filetags.join(" "));
+		}
+		println!(
+			"  tags: {}",
+			if tags.is_empty() {
+				"-".into()
+			} else {
+				fmt(&tags)
+			}
+		);
+		let prot = (0..d.headings.len()).filter(|&i| d.is_protected(i)).count();
+		println!(
+			"  protected ({}): {prot} heading(s)",
+			d.protected_tags.join(",")
+		);
+	}
+	Ok(())
+}
+
+fn cmd_outline(docs: &[Doc], depth: Option<usize>, under: Option<String>, ctx: &Ctx) -> Res {
+	if under.is_some() && docs.len() > 1 {
+		return Err("--under needs a single file".into());
+	}
+	let prefix = docs.len() > 1;
+	let mut out = vec![];
+	for d in docs {
+		let root = under.as_deref().map(|s| d.resolve(s)).transpose()?;
+		if prefix && !ctx.json {
+			println!("# {}", d.path.display());
+		}
+		for i in 0..d.headings.len() {
+			let h = &d.headings[i];
+			if depth.is_some_and(|m| h.level > m) {
+				continue;
+			}
+			if let Some(r) = root
+				&& r != i && !d.is_descendant(i, r)
+			{
+				continue;
+			}
+			if ctx.json {
+				out.push(heading_out(d, i));
+			} else {
+				let base = root.map_or(1, |r| d.headings[r].level);
+				let indent = "  ".repeat(h.level.saturating_sub(base));
+				println!("{indent}{}", heading_line(d, i, false, false));
+			}
+		}
+	}
+	if ctx.json { print_json(&out) } else { Ok(()) }
+}
+
+fn cmd_find(a: FindArgs, ctx: &Ctx) -> Res {
+	let docs = load_all(&a.paths)?;
+	if a.under.is_some() && docs.len() > 1 {
+		return Err("--under needs a single file".into());
+	}
+	let date = |s: &Option<String>| {
+		s.as_deref()
+			.map(|s| DateFilter::parse(s, ctx.today))
+			.transpose()
+	};
+	let (f_sched, f_dl, f_closed) = (date(&a.scheduled)?, date(&a.deadline)?, date(&a.closed)?);
+	let f_date = a
+		.date
+		.as_deref()
+		.map(|s| DateRange::parse(s, ctx.today))
+		.transpose()?;
+	let text_re = a
+		.text
+		.as_deref()
+		.map(|t| {
+			let pat = if a.regex {
+				t.to_string()
+			} else {
+				regex::escape(t)
+			};
+			RegexBuilder::new(&pat)
+				.case_insensitive(true)
+				.build()
+				.map_err(|e| e.to_string())
+		})
+		.transpose()?;
+	let props: Vec<(String, Option<String>)> = a
+		.prop
+		.iter()
+		.map(|p| match p.split_once('=') {
+			Some((k, v)) => (k.to_string(), Some(v.to_string())),
+			None => (p.clone(), None),
+		})
+		.collect();
+
+	let prefix = docs.len() > 1;
+	let mut hits = vec![];
+	let mut total = 0;
+	for d in &docs {
+		for s in &a.status {
+			if !s.eq_ignore_ascii_case("none") && d.keywords.canonical(s).is_none() {
+				eprintln!(
+					"warning: '{s}' is not a keyword in {} ({})",
+					d.path.display(),
+					d.keywords.describe()
+				);
+			}
+		}
+		let root = a.under.as_deref().map(|s| d.resolve(s)).transpose()?;
+		for i in 0..d.headings.len() {
+			let h = &d.headings[i];
+			let kw = h.keyword.as_deref();
+			if !a.status.is_empty()
+				&& !a.status.iter().any(|s| match kw {
+					None => s.eq_ignore_ascii_case("none"),
+					Some(k) => s.eq_ignore_ascii_case(k),
+				}) {
+				continue;
+			}
+			if a.todo && !kw.is_some_and(|k| !d.keywords.is_done(k)) {
+				continue;
+			}
+			if a.done && !kw.is_some_and(|k| d.keywords.is_done(k)) {
+				continue;
+			}
+			if a.level.is_some_and(|l| l != h.level)
+				|| a.priority
+					.is_some_and(|p| h.priority != Some(p.to_ascii_uppercase()))
+			{
+				continue;
+			}
+			if let Some(r) = root
+				&& !d.is_descendant(i, r)
+			{
+				continue;
+			}
+			if !a.tags.is_empty() || !a.not_tags.is_empty() {
+				let all = d.all_tags(i);
+				if !a.tags.iter().all(|t| all.contains(t))
+					|| a.not_tags.iter().any(|t| all.contains(t))
+				{
+					continue;
+				}
+			}
+			if f_sched
+				.as_ref()
+				.is_some_and(|f| !f.matches(h.planning.scheduled.as_ref()))
+				|| f_dl
+					.as_ref()
+					.is_some_and(|f| !f.matches(h.planning.deadline.as_ref()))
+				|| f_closed
+					.as_ref()
+					.is_some_and(|f| !f.matches(h.planning.closed.as_ref()))
+			{
+				continue;
+			}
+			if let Some(r) = &f_date {
+				let hit = h
+					.planning
+					.scheduled
+					.iter()
+					.chain(&h.planning.deadline)
+					.any(|t| t.occurs_in(r))
+					|| h.timestamps.iter().any(|t| t.active && t.occurs_in(r));
+				if !hit {
+					continue;
+				}
+			}
+			if !props.iter().all(|(k, v)| match (h.prop(k), v) {
+				(Some(_), None) => true,
+				(Some(have), Some(want)) => have == want,
+				(None, _) => false,
+			}) {
+				continue;
+			}
+			if let Some(re) = &text_re {
+				let mut hit = re.is_match(&h.title);
+				if !hit && a.in_body && !d.is_protected(i) {
+					hit = d.lines[h.body_start..h.section_end]
+						.iter()
+						.any(|l| re.is_match(l));
+				}
+				if !hit {
+					continue;
+				}
+			}
+			total += 1;
+			if hits.len() < a.limit {
+				hits.push((d, i));
+			}
+		}
+	}
+	if ctx.json {
+		return print_json(&json!({
+			"total": total,
+			"shown": hits.len(),
+			"results": hits.iter().map(|(d, i)| heading_out(d, *i)).collect::<Vec<_>>(),
+		}));
+	}
+	for (d, i) in &hits {
+		println!("{}", heading_line(d, *i, prefix, true));
+	}
+	if total > hits.len() {
+		println!(
+			"… {} more (raise --limit or narrow filters)",
+			total - hits.len()
+		);
+	} else if total == 0 {
+		println!("no matches");
+	}
+	Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cmd_show(
+	d: &Doc,
+	sel: &str,
+	body: bool,
+	raw: bool,
+	subtree: bool,
+	max: usize,
+	reveal: bool,
+	ctx: &Ctx,
+) -> Res {
+	let i = d.resolve(sel)?;
+	let h = &d.headings[i];
+	let protected = if subtree && raw {
+		(0..d.headings.len()).any(|j| (j == i || d.is_descendant(j, i)) && d.is_protected(j))
+	} else {
+		d.is_protected(i)
+	};
+	let hidden = protected && !reveal && (body || raw);
+	let br = d.body_range(i);
+	let body_lines: Vec<&str> = if body && !hidden {
+		d.lines[br.clone()].iter().map(String::as_str).collect()
+	} else {
+		vec![]
+	};
+	let raw_lines: Vec<&str> = if raw && !hidden {
+		let end = if subtree {
+			h.subtree_end
+		} else {
+			h.section_end
+		};
+		d.lines[h.line..end].iter().map(String::as_str).collect()
+	} else {
+		vec![]
 	};
 
-	if verbose {
-		eprintln!("Parsing file: {}", file_path);
-		eprintln!("File size: {} bytes", content.len());
-		eprintln!("Lines: {}", content.lines().count());
-		eprintln!();
+	if ctx.json {
+		return print_json(&json!({
+			"heading": heading_out(d, i),
+			"lines": [h.line + 1, h.section_end],
+			"subtree_lines": [h.line + 1, h.subtree_end],
+			"properties": h.properties.iter().cloned().collect::<BTreeMap<_, _>>(),
+			"timestamps": h.timestamps.iter().map(|t| &t.raw).collect::<Vec<_>>(),
+			"clock_minutes": h.clock_minutes(),
+			"children": h.children.iter().map(|&c| heading_out(d, c)).collect::<Vec<_>>(),
+			"body_line_count": br.len(),
+			"body": if body && !hidden { Some(body_lines.iter().take(max).collect::<Vec<_>>()) } else { None },
+			"raw": if raw && !hidden { Some(raw_lines.iter().take(max).collect::<Vec<_>>()) } else { None },
+			"hidden": hidden,
+		}));
 	}
 
-	let mut parser = OrgParser::new(&content);
-	let notes = parser.parse();
-
-	if verbose {
-		eprintln!("Found {} top-level notes", notes.len());
-		eprintln!();
+	println!("{}", heading_line(d, i, false, true));
+	println!(
+		"lines: {}-{} (subtree to {})",
+		h.line + 1,
+		h.section_end,
+		h.subtree_end
+	);
+	let inherited: Vec<String> = d
+		.all_tags(i)
+		.into_iter()
+		.filter(|t| !h.tags.contains(t))
+		.collect();
+	if !inherited.is_empty() {
+		println!("inherited tags: {}", inherited.join(" "));
 	}
-
-	if use_tui {
-		if let Err(e) = run_tui(notes, file_path.to_string()) {
-			eprintln!("Error running TUI: {}", e);
-			std::process::exit(1);
+	for (label, t) in [
+		("SCHEDULED", &h.planning.scheduled),
+		("DEADLINE", &h.planning.deadline),
+		("CLOSED", &h.planning.closed),
+	] {
+		if let Some(t) = t {
+			println!("{label}: {}", t.raw);
 		}
+	}
+	for (k, v) in &h.properties {
+		println!(":{k}: {v}");
+	}
+	if !h.clocks.is_empty() {
+		let m = h.clock_minutes();
+		let running = h.clocks.iter().filter(|c| c.running).count();
+		println!(
+			"clock: {}h{:02}m in {} entries{}",
+			m / 60,
+			m % 60,
+			h.clocks.len(),
+			if running > 0 {
+				format!(", {running} running")
+			} else {
+				String::new()
+			}
+		);
+	}
+	let active: Vec<&str> = h
+		.timestamps
+		.iter()
+		.filter(|t| t.active)
+		.map(|t| t.raw.as_str())
+		.collect();
+	if !active.is_empty() {
+		println!("timestamps: {}", active.join(" "));
+	}
+	if protected {
+		println!("protected: yes ({})", d.protected_tags.join(","));
+	}
+	if hidden {
+		println!(
+			"[content hidden: protected heading; pass --reveal only if the user asked for it]"
+		);
+	} else if body {
+		println!("--- body ({} lines) ---", br.len());
+		print_capped(&body_lines, max);
+	} else if raw {
+		println!("--- raw ---");
+		print_capped(&raw_lines, max);
 	} else {
-		if show_summary {
-			print_time_summary(&notes);
-		}
-
-		match format.as_str() {
-			"json" => match serde_json::to_string_pretty(&notes) {
-				Ok(json_output) => println!("{}", json_output),
-				Err(err) => {
-					eprintln!("Error serializing to JSON: {}", err);
-					std::process::exit(1);
-				},
-			},
-			"yaml" => match serde_yaml::to_string(&notes) {
-				Ok(yaml_output) => println!("{}", yaml_output),
-				Err(err) => {
-					eprintln!("Error serializing to YAML: {}", err);
-					std::process::exit(1);
-				},
-			},
-			_ => unreachable!(),
+		println!("body: {} line(s) (use --body)", br.len());
+	}
+	if !h.children.is_empty() {
+		println!("children ({}):", h.children.len());
+		for &c in &h.children {
+			println!("  {}", heading_line(d, c, false, false));
 		}
 	}
+	Ok(())
+}
+
+fn print_capped(lines: &[&str], max: usize) {
+	for l in lines.iter().take(max) {
+		println!("{l}");
+	}
+	if lines.len() > max {
+		println!("… {} more line(s) (raise --max-lines)", lines.len() - max);
+	}
+}
+
+fn cmd_grep(
+	docs: &[Doc],
+	pattern: &str,
+	case_sensitive: bool,
+	limit: usize,
+	reveal: bool,
+	ctx: &Ctx,
+) -> Res {
+	let insensitive = !case_sensitive && !pattern.chars().any(char::is_uppercase);
+	let re = RegexBuilder::new(pattern)
+		.case_insensitive(insensitive)
+		.build()
+		.map_err(|e| e.to_string())?;
+	let prefix = docs.len() > 1;
+	let mut hits = vec![];
+	let mut total = 0;
+	let mut skipped = 0;
+	for d in docs {
+		for (n, l) in d.lines.iter().enumerate() {
+			if !re.is_match(l) {
+				continue;
+			}
+			let owner = d.heading_at_line(n);
+			let is_heading = owner.is_some_and(|o| d.headings[o].line == n);
+			if !reveal && !is_heading && owner.is_some_and(|o| d.is_protected(o)) {
+				skipped += 1;
+				continue;
+			}
+			total += 1;
+			if hits.len() < limit {
+				hits.push((d, n, owner));
+			}
+		}
+	}
+	if ctx.json {
+		let rows: Vec<_> = hits
+			.iter()
+			.map(|(d, n, o)| {
+				json!({
+					"file": d.path.display().to_string(),
+					"line": n + 1,
+					"id": o.map(|o| d.headings[o].id()),
+					"text": truncate(&d.lines[*n], 300),
+				})
+			})
+			.collect();
+		return print_json(
+			&json!({"total": total, "shown": rows.len(), "skipped_protected": skipped, "results": rows}),
+		);
+	}
+	for (d, n, o) in &hits {
+		let file = if prefix {
+			format!("{}:", d.path.display())
+		} else {
+			String::new()
+		};
+		let id = o.map_or("-".to_string(), |o| d.headings[o].id());
+		println!(
+			"{file}L{}  [{id}]  {}",
+			n + 1,
+			truncate(d.lines[*n].trim_end(), 200)
+		);
+	}
+	if total > hits.len() {
+		println!("… {} more (raise --limit)", total - hits.len());
+	} else if total == 0 {
+		println!("no matches");
+	}
+	if skipped > 0 {
+		println!("({skipped} match(es) inside protected headings skipped)");
+	}
+	Ok(())
+}
+
+fn cmd_agenda(docs: &[Doc], range: &str, all: bool, ctx: &Ctx) -> Res {
+	let r = DateRange::parse(range, ctx.today)?;
+	if r.start.is_none() || r.end.is_none() {
+		return Err("agenda needs a closed range, e.g. today..+6d".into());
+	}
+	let prefix = docs.len() > 1;
+	let mut days: BTreeMap<NaiveDate, Vec<String>> = BTreeMap::new();
+	let mut overdue = vec![];
+	for d in docs {
+		for i in 0..d.headings.len() {
+			let h = &d.headings[i];
+			let done = h.keyword.as_deref().is_some_and(|k| d.keywords.is_done(k));
+			if done && !all {
+				continue;
+			}
+			let line = heading_line(d, i, prefix, true);
+			let mut seen = vec![];
+			let mut add = |kind: &str, t: &ts::Timestamp| {
+				for day in t.occurrences(&r, 400) {
+					let key = (day, kind.to_string());
+					if seen.contains(&key) {
+						continue;
+					}
+					seen.push(key);
+					let time = t
+						.time
+						.as_deref()
+						.map(|x| format!("{x} "))
+						.unwrap_or_default();
+					days.entry(day)
+						.or_default()
+						.push(format!("  {time}{kind:<5} {line}"));
+				}
+			};
+			if let Some(t) = &h.planning.scheduled {
+				add("sched", t);
+			}
+			if let Some(t) = &h.planning.deadline {
+				add("dl", t);
+			}
+			for t in h.timestamps.iter().filter(|t| t.active) {
+				add("ts", t);
+			}
+			if !done && h.keyword.is_some() && r.contains(ctx.today) {
+				for (kind, t) in [
+					("sched", &h.planning.scheduled),
+					("dl", &h.planning.deadline),
+				] {
+					if let Some(t) = t
+						&& t.date < ctx.today
+					{
+						let ago = (ctx.today - t.date).num_days();
+						overdue.push(format!("  {kind:<5} {ago}d ago  {line}"));
+					}
+				}
+			}
+		}
+	}
+	println!("agenda {}", r.describe());
+	if !overdue.is_empty() {
+		println!("OVERDUE:");
+		overdue.iter().for_each(|l| println!("{l}"));
+	}
+	for (day, items) in &days {
+		let mark = if *day == ctx.today { "  <- today" } else { "" };
+		println!(
+			"{} {}{mark}",
+			day.format("%Y-%m-%d"),
+			ts::day_name(*day, false)
+		);
+		items.iter().for_each(|l| println!("{l}"));
+	}
+	if overdue.is_empty() && days.is_empty() {
+		println!("nothing scheduled");
+	}
+	Ok(())
+}
+
+fn cmd_clock(docs: &[Doc], range: Option<&str>, ctx: &Ctx) -> Res {
+	let r = range
+		.map(|s| DateRange::parse(s, ctx.today))
+		.transpose()?
+		.unwrap_or_default();
+	let prefix = docs.len() > 1;
+	let mut total = 0;
+	for d in docs {
+		for i in 0..d.headings.len() {
+			let cs: Vec<_> = d.headings[i]
+				.clocks
+				.iter()
+				.filter(|c| r.contains(c.start.date))
+				.collect();
+			if cs.is_empty() {
+				continue;
+			}
+			let m: u32 = cs.iter().filter_map(|c| c.minutes).sum();
+			let running = if cs.iter().any(|c| c.running) {
+				" (running)"
+			} else {
+				""
+			};
+			total += m;
+			println!(
+				"{:>3}h{:02}m{running}  {}",
+				m / 60,
+				m % 60,
+				heading_line(d, i, prefix, true)
+			);
+		}
+	}
+	println!(
+		"total {}h{:02}m{}",
+		total / 60,
+		total % 60,
+		if range.is_some() {
+			format!(" in {}", r.describe())
+		} else {
+			String::new()
+		}
+	);
+	Ok(())
+}
+
+// ---------- write commands ----------
+
+fn write(file: &Path, sel: &str, ctx: &Ctx, f: impl FnOnce(&mut Doc, usize) -> Res<usize>) -> Res {
+	let mut d = Doc::load(file)?;
+	let i = resolve_checked(&d, sel, ctx)?;
+	let i = f(&mut d, i)?;
+	finish_write(&d, Some(i), ctx)
+}
+
+fn resolve_checked(d: &Doc, sel: &str, ctx: &Ctx) -> Res<usize> {
+	let i = d.resolve(sel)?;
+	if let Some(e) = &ctx.expect
+		&& !d.headings[i]
+			.title
+			.to_lowercase()
+			.contains(&e.to_lowercase())
+	{
+		return Err(format!(
+			"--expect '{e}' failed: {sel} is now '{}' (ids shift after edits; re-query)",
+			heading_line(d, i, false, true)
+		));
+	}
+	Ok(i)
+}
+
+fn write_planning(file: &Path, sel: &str, kind: PlanKind, when: &str, ctx: &Ctx) -> Res {
+	write(file, sel, ctx, |d, i| {
+		let v = if when.eq_ignore_ascii_case("none") {
+			None
+		} else {
+			Some(ts::parse_when(when, ctx.today, d.ru_days)?)
+		};
+		d.set_planning(i, kind, v)?;
+		Ok(i)
+	})
+}
+
+fn finish_write(d: &Doc, i: Option<usize>, ctx: &Ctx) -> Res {
+	if d.changes.is_empty() {
+		if ctx.json {
+			return print_json(
+				&json!({"ok": true, "changed": false, "heading": i.map(|i| heading_out(d, i))}),
+			);
+		}
+		println!("no change");
+		return Ok(());
+	}
+	if !ctx.dry_run {
+		d.save()?;
+	}
+	if ctx.json {
+		return print_json(&json!({
+			"ok": true,
+			"changed": true,
+			"saved": !ctx.dry_run,
+			"changes": d.changes.iter().map(|c| if c.quiet {
+				json!({"line": c.line + 1, "removed_lines": c.removed.len(), "added_lines": c.added.len()})
+			} else {
+				json!(c)
+			}).collect::<Vec<_>>(),
+			"heading": i.map(|i| heading_out(d, i)),
+		}));
+	}
+	for c in &d.changes {
+		if c.quiet {
+			println!(
+				"@@ L{}: -{} +{} line(s)",
+				c.line + 1,
+				c.removed.len(),
+				c.added.len()
+			);
+			continue;
+		}
+		let shown = c
+			.removed
+			.iter()
+			.map(|l| ('-', l))
+			.chain(c.added.iter().map(|l| ('+', l)));
+		let n = c.removed.len() + c.added.len();
+		println!("@@ L{}", c.line + 1);
+		for (sign, l) in shown.take(30) {
+			println!("{sign} {l}");
+		}
+		if n > 30 {
+			println!("… {} more line(s)", n - 30);
+		}
+	}
+	if let Some(i) = i {
+		println!("=> {}", heading_line(d, i, false, true));
+	}
+	println!(
+		"{}",
+		if ctx.dry_run {
+			"(dry run, not saved)"
+		} else {
+			"saved"
+		}
+	);
+	Ok(())
 }
