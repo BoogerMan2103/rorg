@@ -21,6 +21,7 @@ const ABOUT: &str = "Query and edit org-mode files piece by piece, without loadi
 
 Selectors (SEL): 1.2.3 = positional path (as printed by outline/find) · L42 = heading containing line 42 ·
 id:XYZ = :ID:/:CUSTOM_ID: property · @text = unique title substring · @=Title = exact title.
+Any other text is a title substring too; a pasted heading line (`** TODO Title :tag:`) also works.
 Dates: YYYY-MM-DD, today, tomorrow, yesterday, +3d, -1w, +1m, fri. Ranges: A..B, ..B, A.., overdue, week.
 Positional ids shift after add/move/delete — re-query (every write prints the new id),
 or guard writes with --expect TEXT (aborts unless the target title contains TEXT).

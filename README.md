@@ -28,6 +28,7 @@ rorg find work.org --scheduled none --todo      # unscheduled open tasks
 rorg find work.org --todo --scheduled --sort scheduled   # planned open tasks, by date (like agenda)
 rorg show work.org 2.3                 # metadata + children, body size only
 rorg show work.org 2.3 --body          # plus body text
+rorg show work.org "** WAIT Ping vendor :client:" --body   # heading pasted from Emacs
 rorg grep 'invoice' work.org           # matching lines with owning heading id
 rorg agenda ~/org -r today..+6d        # by day, plus overdue
 rorg clock work.org -r 2026-11-01..    # clocked time per heading
@@ -44,6 +45,7 @@ Output line format: `ID  L<line>  KEYWORD [#P] Title  :tags:  sched:… dl:… c
 | `id:abc`   | `:ID:` or `:CUSTOM_ID:` property                |
 | `@vendor`  | unique case-insensitive title substring         |
 | `@=Exact`  | exact title                                     |
+| `vendor`, `** WAIT Ping vendor :x:` | anything else: title substring; a pasted heading line is reduced to its title |
 
 Positional ids shift after `add`/`move`/`delete`. Every write prints the new id; for
 safety add `--expect TEXT` (aborts unless the target title contains TEXT).

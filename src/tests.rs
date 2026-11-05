@@ -108,6 +108,14 @@ fn selectors() {
 			.unwrap_err()
 			.contains("before the first heading")
 	);
+	// pasted heading line, with or without @
+	assert_eq!(d.resolve("@** WAIT Answer from vendor").unwrap(), 2);
+	assert_eq!(
+		d.resolve("* TODO [#A] Project Setup   :urgent:").unwrap(),
+		0
+	);
+	assert_eq!(d.resolve("answer from").unwrap(), 2);
+	assert!(d.resolve("nothing like this").is_err());
 }
 
 #[test]

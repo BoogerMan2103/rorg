@@ -415,8 +415,7 @@ impl Doc {
 			return self.unique(|h| h.title == t, sel);
 		}
 		if let Some(t) = s.strip_prefix('@') {
-			let t = t.to_lowercase();
-			return self.unique(|h| h.title.to_lowercase().contains(&t), sel);
+			return self.by_title(t, sel);
 		}
 		if !s.is_empty()
 			&& s.split('.')
@@ -429,9 +428,27 @@ impl Doc {
 				.position(|h| h.path == path)
 				.ok_or_else(|| format!("no heading at path {s} in {}", self.path.display()));
 		}
-		Err(format!(
-			"bad selector '{sel}': use 1.2.3, L42, id:XYZ, @title-substring or @=Exact title"
-		))
+		self.by_title(s, sel).map_err(|e| {
+			format!("{e}\n(selectors: 1.2.3, L42, id:XYZ, @title-substring, @=Exact title)")
+		})
+	}
+
+	/// Unique case-insensitive title substring. If nothing matches, retries with the text
+	/// parsed as a pasted heading line (stars, keyword, priority, tags stripped).
+	fn by_title(&self, t: &str, sel: &str) -> Result<usize, String> {
+		let raw = t.trim().to_lowercase();
+		let first = self.unique(|h| h.title.to_lowercase().contains(&raw), sel);
+		if !matches!(&first, Err(e) if e.starts_with("no heading")) {
+			return first;
+		}
+		let stripped = t.trim().trim_start_matches('*').trim_start();
+		let title = parse_heading_text(stripped, &self.keywords)
+			.2
+			.to_lowercase();
+		if title.is_empty() || title == raw {
+			return first;
+		}
+		self.unique(|h| h.title.to_lowercase().contains(&title), sel)
 	}
 
 	fn unique(&self, f: impl Fn(&Heading) -> bool, what: &str) -> Result<usize, String> {
