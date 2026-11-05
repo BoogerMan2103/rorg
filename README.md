@@ -67,8 +67,9 @@ rorg tag work.org 2.3 --add urgent --rm someday
 rorg priority work.org 2.3 A
 rorg title work.org 2.3 "New title"
 rorg prop work.org 2.3 OWNER me
-rorg body work.org 2.3 --append "Called them, waiting for reply"
-echo "full new body" | rorg body work.org 2.3 --set -
+rorg body work.org 2.3 "Called them, waiting for reply"   # append (default)
+make test 2>&1 | tail -5 | rorg body work.org 2.3 --append   # no TEXT: read stdin
+echo "full new body" | rorg body work.org 2.3 --set
 rorg add work.org --under 2 --title "Ping vendor" --status WAIT --scheduled +2d
 rorg move work.org 2.3 --under @Archive
 rorg delete work.org 2.3 --expect "Ping vendor"

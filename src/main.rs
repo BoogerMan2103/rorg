@@ -13,7 +13,7 @@ use regex::RegexBuilder;
 use serde::Serialize;
 use serde_json::json;
 use std::collections::BTreeMap;
-use std::io::Read;
+use std::io::{IsTerminal, Read};
 use std::path::{Path, PathBuf};
 use ts::{DateFilter, DateRange};
 
@@ -204,18 +204,20 @@ enum Cmd {
 		#[arg(long)]
 		unset: bool,
 	},
-	/// Append to or replace the free-text body. TEXT `-` reads stdin
+	/// Append to (default) or replace the free-text body. Without TEXT reads stdin
 	Body {
 		/// Org file
 		file: PathBuf,
 		/// Target heading: 1.2.3 | L42 | id:X | @title-substring | @=Exact title
 		sel: String,
-		/// Text to add after the existing body (`-` = stdin)
-		#[arg(long, conflicts_with = "set", required_unless_present = "set")]
-		append: Option<String>,
-		/// Replace the body with this text (`-` = stdin, empty clears); planning and drawers are kept
+		/// Text; omit or `-` to read stdin
+		text: Option<String>,
+		/// Add after the existing body (default)
+		#[arg(long, conflicts_with = "set")]
+		append: bool,
+		/// Replace the body (empty text clears); planning and drawers are kept
 		#[arg(long)]
-		set: Option<String>,
+		set: bool,
 	},
 	/// Insert a new heading
 	Add {
@@ -498,13 +500,15 @@ fn run(cmd: Cmd, ctx: &Ctx) -> Res {
 		Cmd::Body {
 			file,
 			sel,
-			append,
+			text,
+			append: _,
 			set,
 		} => write(&file, &sel, ctx, |d, i| {
-			match (&append, &set) {
-				(Some(t), _) => d.append_body(i, &stdin_or(t)?)?,
-				(_, Some(t)) => d.set_body(i, &stdin_or(t)?)?,
-				_ => unreachable!(),
+			let text = stdin_or(text.as_deref().unwrap_or("-"))?;
+			if set {
+				d.set_body(i, &text)?;
+			} else {
+				d.append_body(i, &text)?;
 			}
 			Ok(i)
 		}),
@@ -607,6 +611,9 @@ fn load_all(paths: &[PathBuf]) -> Res<Vec<Doc>> {
 fn stdin_or(t: &str) -> Res<String> {
 	if t != "-" {
 		return Ok(t.to_string());
+	}
+	if std::io::stdin().is_terminal() {
+		return Err("no text given and stdin is a terminal; pass TEXT or pipe it in".into());
 	}
 	let mut s = String::new();
 	std::io::stdin()
