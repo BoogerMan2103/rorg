@@ -219,6 +219,18 @@ enum Cmd {
 		#[arg(long)]
 		set: bool,
 	},
+	/// Add a timestamped note (like org C-c C-z), newest first. Without TEXT reads stdin
+	Note {
+		/// Org file
+		file: PathBuf,
+		/// Target heading: 1.2.3 | L42 | id:X | @title-substring | @=Exact title
+		sel: String,
+		/// Note text (multi-line ok); omit or `-` to read stdin
+		text: Option<String>,
+		/// Put the note into the :LOGBOOK: drawer (org-log-into-drawer); default from $RORG_LOG_INTO_DRAWER
+		#[arg(long)]
+		drawer: bool,
+	},
 	/// Insert a new heading
 	Add {
 		/// Org file
@@ -510,6 +522,18 @@ fn run(cmd: Cmd, ctx: &Ctx) -> Res {
 			} else {
 				d.append_body(i, &text)?;
 			}
+			Ok(i)
+		}),
+		Cmd::Note {
+			file,
+			sel,
+			text,
+			drawer,
+		} => write(&file, &sel, ctx, |d, i| {
+			let text = stdin_or(text.as_deref().unwrap_or("-"))?;
+			let env_drawer = std::env::var("RORG_LOG_INTO_DRAWER")
+				.is_ok_and(|v| !matches!(v.trim(), "" | "0" | "nil" | "false"));
+			d.add_note(i, &text, ctx.now, drawer || env_drawer)?;
 			Ok(i)
 		}),
 		Cmd::Add {
@@ -1088,6 +1112,17 @@ fn cmd_show(
 				String::new()
 			}
 		);
+	}
+	let notes: Vec<&String> = d.lines[h.line + 1..h.section_end]
+		.iter()
+		.filter(|l| l.trim_start().starts_with("- Note taken on "))
+		.collect();
+	if let Some(first) = notes.first() {
+		let when = ts::find_all(first)
+			.first()
+			.map(|t| t.short())
+			.unwrap_or_default();
+		println!("notes: {} (latest {when}; see --raw)", notes.len());
 	}
 	let active: Vec<&str> = h
 		.timestamps

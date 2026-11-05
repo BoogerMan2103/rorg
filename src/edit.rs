@@ -286,6 +286,51 @@ impl Doc {
 		Ok(())
 	}
 
+	/// Timestamped note like org-add-note (C-c C-z), newest first: directly under the
+	/// heading's metadata, or at the top of :LOGBOOK: when `into_drawer`.
+	pub fn add_note(
+		&mut self,
+		i: usize,
+		text: &str,
+		now: NaiveDateTime,
+		into_drawer: bool,
+	) -> Result<(), String> {
+		let text = text.trim_end_matches('\n');
+		if text.trim().is_empty() {
+			return Err("note text is empty".into());
+		}
+		let indent = self.meta_indent(i);
+		let mut lines = vec![format!(
+			"{indent}- Note taken on {} \\\\",
+			ts::format_now(now, self.ru_days)
+		)];
+		lines.extend(text.split('\n').map(|l| {
+			if l.trim().is_empty() {
+				String::new()
+			} else {
+				format!("{indent}  {l}")
+			}
+		}));
+		let h = self.headings[i].clone();
+		if !into_drawer {
+			self.splice(h.body_start, 0, lines, false);
+			return Ok(());
+		}
+		let meta_end = h.props_range.as_ref().map_or(h.planning_end, |r| r.end);
+		match (meta_end..h.body_start)
+			.find(|&j| self.lines[j].trim().eq_ignore_ascii_case(":LOGBOOK:"))
+		{
+			Some(j) => self.splice(j + 1, 0, lines, false),
+			None => {
+				let mut block = vec![format!("{indent}:LOGBOOK:")];
+				block.extend(lines);
+				block.push(format!("{indent}:END:"));
+				self.splice(meta_end, 0, block, false);
+			},
+		}
+		Ok(())
+	}
+
 	/// Line index and level at which a heading should be inserted.
 	fn insert_point(&self, pos: Pos) -> (usize, usize) {
 		match pos {

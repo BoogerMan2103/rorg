@@ -319,3 +319,47 @@ fn add_move_delete() {
 	d.delete_subtree(k);
 	assert_eq!(d.render(), SAMPLE);
 }
+
+#[test]
+fn notes() {
+	let mut d = doc();
+	let v = d.resolve("@vendor").unwrap();
+	d.add_note(v, "first\nsecond", now(), false).unwrap();
+	d.add_note(v, "newer", now(), false).unwrap();
+	let l = d.headings[v].line;
+	assert_eq!(
+		&d.lines[l + 1..l + 6],
+		&[
+			"- Note taken on [2024-02-01 Thu 12:30] \\\\",
+			"  newer",
+			"- Note taken on [2024-02-01 Thu 12:30] \\\\",
+			"  first",
+			"  second",
+		]
+	);
+
+	// into existing LOGBOOK, at its top, before CLOCK lines
+	d.add_note(0, "logged", now(), true).unwrap();
+	let lb = d.lines.iter().position(|l| l == ":LOGBOOK:").unwrap();
+	assert_eq!(
+		d.lines[lb + 1],
+		"- Note taken on [2024-02-01 Thu 12:30] \\\\"
+	);
+	assert_eq!(d.lines[lb + 2], "  logged");
+	assert!(d.lines[lb + 3].starts_with("CLOCK:"));
+
+	// new LOGBOOK created after planning when missing
+	let h = d.resolve("@habit").unwrap();
+	d.add_note(h, "x", now(), true).unwrap();
+	let l = d.headings[h].line;
+	assert_eq!(
+		&d.lines[l + 2..l + 6],
+		&[
+			":LOGBOOK:",
+			"- Note taken on [2024-02-01 Thu 12:30] \\\\",
+			"  x",
+			":END:"
+		]
+	);
+	assert!(d.add_note(h, "  \n", now(), false).is_err());
+}

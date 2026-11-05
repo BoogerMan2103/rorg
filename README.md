@@ -70,6 +70,7 @@ rorg prop work.org 2.3 OWNER me
 rorg body work.org 2.3 "Called them, waiting for reply"   # append (default)
 make test 2>&1 | tail -5 | rorg body work.org 2.3 --append   # no TEXT: read stdin
 echo "full new body" | rorg body work.org 2.3 --set
+rorg note work.org 2.3 "Deployed, no errors"   # "- Note taken on [now] \\" entry, newest first
 rorg add work.org --under 2 --title "Ping vendor" --status WAIT --scheduled +2d
 rorg move work.org 2.3 --under @Archive
 rorg delete work.org 2.3 --expect "Ping vendor"
@@ -86,6 +87,9 @@ The `|` split drives org semantics (CLOSED on done, hiding done items in agenda)
 `find --todo` / `--done` match the same split unless narrowed with
 `$RORG_FIND_TODO` / `$RORG_FIND_DONE`, e.g. `RORG_FIND_TODO="TODO WAIT"` to leave
 projects out of `--todo`, `RORG_FIND_DONE="DONE OKAY"` to leave cancelled items out of `--done`.
+
+Notes go directly under the heading's metadata (org default, `org-log-into-drawer` nil);
+pass `--drawer` or set `RORG_LOG_INTO_DRAWER=1` to put them into `:LOGBOOK:`.
 
 Protected tags are configurable via `$RORG_PROTECT_TAGS` (default `crypt,secret`).
 
