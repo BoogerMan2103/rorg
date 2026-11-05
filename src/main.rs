@@ -48,11 +48,13 @@ struct Cli {
 enum Cmd {
 	/// Overview: size, TODO keywords, keyword counts, tags
 	Info {
+		/// Org files or directories (searched recursively for *.org)
 		#[arg(required = true)]
 		paths: Vec<PathBuf>,
 	},
 	/// Heading tree (no bodies)
 	Outline {
+		/// Org files or directories (searched recursively for *.org)
 		#[arg(required = true)]
 		paths: Vec<PathBuf>,
 		/// Max heading level to show
@@ -66,7 +68,9 @@ enum Cmd {
 	Find(FindArgs),
 	/// One heading: metadata, children; body only with --body
 	Show {
+		/// Org file
 		file: PathBuf,
+		/// Target heading: 1.2.3 | L42 | id:X | @title-substring | @=Exact title
 		sel: String,
 		/// Print the free-text body (without drawers)
 		#[arg(long)]
@@ -77,6 +81,7 @@ enum Cmd {
 		/// With --raw: include the whole subtree
 		#[arg(long)]
 		subtree: bool,
+		/// Max body/raw lines to print
 		#[arg(long, default_value_t = 200)]
 		max_lines: usize,
 		/// Show body even for protected (crypt/secret) headings
@@ -85,21 +90,27 @@ enum Cmd {
 	},
 	/// Search lines by regex; prints line number, owning heading id, the line
 	Grep {
+		/// Regex; case-insensitive unless it contains uppercase (smart case)
 		pattern: String,
+		/// Org files or directories (searched recursively for *.org)
 		#[arg(required = true)]
 		paths: Vec<PathBuf>,
 		/// Case-sensitive (default: smart case)
 		#[arg(short = 's', long)]
 		case_sensitive: bool,
+		/// Max matches to print (total is still reported)
 		#[arg(long, default_value_t = 50)]
 		limit: usize,
+		/// Include matches inside protected (crypt/secret) headings
 		#[arg(long)]
 		reveal: bool,
 	},
 	/// Scheduled/deadline/timestamped open items by day, plus overdue
 	Agenda {
+		/// Org files or directories (searched recursively for *.org)
 		#[arg(required = true)]
 		paths: Vec<PathBuf>,
+		/// Date range, e.g. today..+6d, week, 2026-11-01..2026-11-30
 		#[arg(short, long, default_value = "today..+6d")]
 		range: String,
 		/// Include done items
@@ -108,6 +119,7 @@ enum Cmd {
 	},
 	/// Clocked time per heading
 	Clock {
+		/// Org files or directories (searched recursively for *.org)
 		#[arg(required = true)]
 		paths: Vec<PathBuf>,
 		/// Only CLOCK entries starting in this range
@@ -116,8 +128,11 @@ enum Cmd {
 	},
 	/// Set TODO keyword (`none` to clear). Adds/removes CLOSED like org-log-done; handles repeaters
 	Status {
+		/// Org file
 		file: PathBuf,
+		/// Target heading: 1.2.3 | L42 | id:X | @title-substring | @=Exact title
 		sel: String,
+		/// New keyword (case-insensitive), or `none` to clear
 		keyword: String,
 		/// Don't touch CLOSED / LAST_REPEAT
 		#[arg(long)]
@@ -125,16 +140,23 @@ enum Cmd {
 	},
 	/// Replace heading title (keyword, priority, tags kept)
 	Title {
+		/// Org file
 		file: PathBuf,
+		/// Target heading: 1.2.3 | L42 | id:X | @title-substring | @=Exact title
 		sel: String,
+		/// New title
 		text: String,
 	},
 	/// Change tags
 	Tag {
+		/// Org file
 		file: PathBuf,
+		/// Target heading: 1.2.3 | L42 | id:X | @title-substring | @=Exact title
 		sel: String,
+		/// Tags to add (comma-separated)
 		#[arg(long, value_delimiter = ',')]
 		add: Vec<String>,
+		/// Tags to remove (comma-separated)
 		#[arg(long, value_delimiter = ',')]
 		rm: Vec<String>,
 		/// Replace all own tags (comma-separated, empty string clears)
@@ -143,55 +165,80 @@ enum Cmd {
 	},
 	/// Set priority letter, or `none`
 	Priority {
+		/// Org file
 		file: PathBuf,
+		/// Target heading: 1.2.3 | L42 | id:X | @title-substring | @=Exact title
 		sel: String,
+		/// Priority letter (A, B, C…) or `none`
 		value: String,
 	},
 	/// Set SCHEDULED (`none` removes). WHEN: DATE [HH:MM] [+1w] [-2d] or raw <...>
 	Schedule {
+		/// Org file
 		file: PathBuf,
+		/// Target heading: 1.2.3 | L42 | id:X | @title-substring | @=Exact title
 		sel: String,
+		/// DATE [HH:MM[-HH:MM]] [+1w repeater] [-2d warning], a raw <…> timestamp, or `none` to remove
 		when: String,
 	},
 	/// Set DEADLINE (`none` removes)
 	Deadline {
+		/// Org file
 		file: PathBuf,
+		/// Target heading: 1.2.3 | L42 | id:X | @title-substring | @=Exact title
 		sel: String,
+		/// DATE [HH:MM[-HH:MM]] [+1w repeater] [-2d warning], a raw <…> timestamp, or `none` to remove
 		when: String,
 	},
 	/// Set a property in the :PROPERTIES: drawer (omit VALUE with --unset to remove)
 	Prop {
+		/// Org file
 		file: PathBuf,
+		/// Target heading: 1.2.3 | L42 | id:X | @title-substring | @=Exact title
 		sel: String,
+		/// Property name
 		key: String,
+		/// Property value
 		value: Option<String>,
+		/// Remove the property (drawer is removed when it becomes empty)
 		#[arg(long)]
 		unset: bool,
 	},
 	/// Append to or replace the free-text body. TEXT `-` reads stdin
 	Body {
+		/// Org file
 		file: PathBuf,
+		/// Target heading: 1.2.3 | L42 | id:X | @title-substring | @=Exact title
 		sel: String,
+		/// Text to add after the existing body (`-` = stdin)
 		#[arg(long, conflicts_with = "set", required_unless_present = "set")]
 		append: Option<String>,
+		/// Replace the body with this text (`-` = stdin, empty clears); planning and drawers are kept
 		#[arg(long)]
 		set: Option<String>,
 	},
 	/// Insert a new heading
 	Add {
+		/// Org file
 		file: PathBuf,
 		#[command(flatten)]
 		pos: PosArgs,
+		/// Heading title
 		#[arg(long)]
 		title: String,
+		/// TODO keyword (case-insensitive)
 		#[arg(long)]
 		status: Option<String>,
+		/// Tags (comma-separated)
 		#[arg(long, value_delimiter = ',')]
 		tags: Vec<String>,
+		/// Priority letter
 		#[arg(long)]
 		priority: Option<char>,
+		/// SCHEDULED: DATE [HH:MM] [+1w] [-2d], or a raw <…> timestamp
 		#[arg(long)]
 		scheduled: Option<String>,
+		/// DEADLINE: same format as --scheduled
 		#[arg(long)]
 		deadline: Option<String>,
 		/// Body text, `-` reads stdin
@@ -199,10 +246,17 @@ enum Cmd {
 		body: Option<String>,
 	},
 	/// Delete a heading with its whole subtree
-	Delete { file: PathBuf, sel: String },
+	Delete {
+		/// Org file
+		file: PathBuf,
+		/// Target heading: 1.2.3 | L42 | id:X | @title-substring | @=Exact title
+		sel: String,
+	},
 	/// Move a subtree (refile within the file); levels are adjusted
 	Move {
+		/// Org file
 		file: PathBuf,
+		/// Target heading: 1.2.3 | L42 | id:X | @title-substring | @=Exact title
 		sel: String,
 		#[command(flatten)]
 		pos: PosArgs,
@@ -224,12 +278,14 @@ struct PosArgs {
 	/// As top-level heading (end of file, or start with --first)
 	#[arg(long, group = "position")]
 	top: bool,
+	/// With --under / --top: insert as the first child / at the top instead of last
 	#[arg(long)]
 	first: bool,
 }
 
 #[derive(Args)]
 struct FindArgs {
+	/// Org files or directories (searched recursively for *.org)
 	#[arg(required = true)]
 	paths: Vec<PathBuf>,
 	/// Keywords, comma-separated; `none` = no keyword
@@ -253,13 +309,16 @@ struct FindArgs {
 	/// Has all these tags (inherited tags count)
 	#[arg(long = "tag", value_delimiter = ',')]
 	tags: Vec<String>,
+	/// Has none of these tags (comma-separated, inherited tags count)
 	#[arg(long = "not-tag", value_delimiter = ',')]
 	not_tags: Vec<String>,
+	/// Exact heading level (1 = top level)
 	#[arg(long)]
 	level: Option<usize>,
 	/// Only descendants of SEL (single file)
 	#[arg(long)]
 	under: Option<String>,
+	/// Priority letter
 	#[arg(long)]
 	priority: Option<char>,
 	/// Has SCHEDULED (no value), or RANGE | any | none. Put after the file paths
@@ -280,6 +339,7 @@ struct FindArgs {
 	/// Order results by date (undated last) instead of file order
 	#[arg(long, value_enum)]
 	sort: Option<SortBy>,
+	/// Max results to print (total is still reported)
 	#[arg(long, default_value_t = 50)]
 	limit: usize,
 }
