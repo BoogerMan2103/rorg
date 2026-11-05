@@ -38,6 +38,9 @@ pub struct Keywords {
 	pub todo: Vec<String>,
 	pub done: Vec<String>,
 	pub source: String,
+	/// Keywords matched by `find --todo` / `--done` (narrower than todo/done if configured).
+	pub find_todo: Vec<String>,
+	pub find_done: Vec<String>,
 }
 
 impl Keywords {
@@ -58,30 +61,42 @@ impl Keywords {
 			todo: vec![],
 			done: vec![],
 			source: source.to_string(),
+			find_todo: vec![],
+			find_done: vec![],
 		};
 		k.parse_into(spec);
+		k.find_todo = k.todo.clone();
+		k.find_done = k.done.clone();
 		k
 	}
 
 	/// From `#+TODO:` lines of the file, else `$RORG_TODO`, else a broad default.
+	/// `$RORG_FIND_TODO` / `$RORG_FIND_DONE` narrow what `find --todo` / `--done` match.
 	fn detect(lines: &[String]) -> Self {
-		let mut k = Self {
-			todo: vec![],
-			done: vec![],
-			source: "file".into(),
-		};
-		for l in lines {
-			if let Some(c) = TODO_LINE_RE.captures(l) {
-				k.parse_into(&c[1]);
+		let file_spec: Vec<String> = lines
+			.iter()
+			.filter_map(|l| TODO_LINE_RE.captures(l).map(|c| c[1].to_string()))
+			.collect();
+		let mut k = if !file_spec.is_empty() {
+			Self::from_spec(&file_spec.join(" "), "file")
+		} else {
+			match std::env::var("RORG_TODO") {
+				Ok(spec) if !spec.trim().is_empty() => Self::from_spec(&spec, "env RORG_TODO"),
+				_ => Self::from_spec(DEFAULT_KEYWORDS, "default"),
 			}
+		};
+		let env_list = |name: &str| -> Option<Vec<String>> {
+			let v = std::env::var(name).ok()?;
+			let list: Vec<String> = v.split_whitespace().map(str::to_string).collect();
+			(!list.is_empty()).then_some(list)
+		};
+		if let Some(l) = env_list("RORG_FIND_TODO") {
+			k.find_todo = l;
 		}
-		if !k.todo.is_empty() || !k.done.is_empty() {
-			return k;
+		if let Some(l) = env_list("RORG_FIND_DONE") {
+			k.find_done = l;
 		}
-		match std::env::var("RORG_TODO") {
-			Ok(spec) if !spec.trim().is_empty() => Self::from_spec(&spec, "env RORG_TODO"),
-			_ => Self::from_spec(DEFAULT_KEYWORDS, "default"),
-		}
+		k
 	}
 
 	pub fn contains(&self, k: &str) -> bool {

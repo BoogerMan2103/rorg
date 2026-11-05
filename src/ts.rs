@@ -145,9 +145,20 @@ fn is_cyrillic(s: &str) -> bool {
 	s.chars().any(|c| ('\u{0400}'..='\u{04FF}').contains(&c))
 }
 
-/// True if the text uses Russian day names in timestamps.
+/// True if most timestamps with a day name use Russian day names.
 pub fn detect_ru(text: &str) -> bool {
-	TS_RE.captures_iter(text).any(|c| is_cyrillic(&c[3]))
+	let (mut ru, mut other) = (0, 0);
+	for c in TS_RE.captures_iter(text) {
+		match c[3]
+			.split_whitespace()
+			.find(|t| t.chars().all(char::is_alphabetic))
+		{
+			Some(day) if is_cyrillic(day) => ru += 1,
+			Some(_) => other += 1,
+			None => {},
+		}
+	}
+	ru > other
 }
 
 pub fn format(date: NaiveDate, extras: &[String], active: bool, ru: bool) -> String {

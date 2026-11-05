@@ -150,6 +150,12 @@ fn date_ranges_and_repeaters() {
 		"<2024-03-01 Пт>"
 	);
 	assert!(ts::parse_when("2024-03-01 junk", today, false).is_err());
+	assert!(!ts::detect_ru(
+		"<2024-01-01 Mon> <2024-01-02 Tue> <2024-01-03 Ср>"
+	));
+	assert!(ts::detect_ru(
+		"<2024-01-01 Пн> <2024-01-02 Вт> <2024-01-03 Wed>"
+	));
 }
 
 #[test]

@@ -25,7 +25,8 @@ Dates: YYYY-MM-DD, today, tomorrow, yesterday, +3d, -1w, +1m, fri. Ranges: A..B,
 Positional ids shift after add/move/delete — re-query (every write prints the new id),
 or guard writes with --expect TEXT (aborts unless the target title contains TEXT).
 Bodies of headings tagged crypt/secret (or inheriting them) are hidden unless --reveal ($RORG_PROTECT_TAGS).
-TODO keywords come from #+TODO lines, else $RORG_TODO, else a broad default (see `rorg info`).";
+TODO keywords come from #+TODO lines, else $RORG_TODO, else a broad default (see `rorg info`).
+$RORG_FIND_TODO / $RORG_FIND_DONE (space-separated) narrow what find --todo / --done match.";
 
 #[derive(Parser)]
 #[command(name = "rorg", version, about = "Agent-friendly org-mode query/edit CLI", long_about = ABOUT)]
@@ -234,10 +235,10 @@ struct FindArgs {
 	/// Keywords, comma-separated; `none` = no keyword
 	#[arg(short, long, value_delimiter = ',')]
 	status: Vec<String>,
-	/// Any not-done keyword
+	/// Any not-done keyword (or $RORG_FIND_TODO list)
 	#[arg(long)]
 	todo: bool,
-	/// Any done keyword
+	/// Any done keyword (or $RORG_FIND_DONE list)
 	#[arg(long)]
 	done: bool,
 	/// Title contains text (case-insensitive)
@@ -261,12 +262,14 @@ struct FindArgs {
 	under: Option<String>,
 	#[arg(long)]
 	priority: Option<char>,
-	/// RANGE | any | none
-	#[arg(long)]
+	/// Has SCHEDULED (no value), or RANGE | any | none. Put after the file paths
+	#[arg(long, num_args = 0..=1, default_missing_value = "any")]
 	scheduled: Option<String>,
-	#[arg(long)]
+	/// Has DEADLINE (no value), or RANGE | any | none
+	#[arg(long, num_args = 0..=1, default_missing_value = "any")]
 	deadline: Option<String>,
-	#[arg(long)]
+	/// Has CLOSED (no value), or RANGE | any | none
+	#[arg(long, num_args = 0..=1, default_missing_value = "any")]
 	closed: Option<String>,
 	/// SCHEDULED, DEADLINE or any active timestamp in title/body falls in RANGE
 	#[arg(long)]
@@ -274,8 +277,18 @@ struct FindArgs {
 	/// KEY or KEY=VALUE
 	#[arg(long)]
 	prop: Vec<String>,
+	/// Order results by date (undated last) instead of file order
+	#[arg(long, value_enum)]
+	sort: Option<SortBy>,
 	#[arg(long, default_value_t = 50)]
 	limit: usize,
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum SortBy {
+	Scheduled,
+	Deadline,
+	Closed,
 }
 
 type Res<T = ()> = Result<T, String>;
@@ -669,6 +682,14 @@ fn cmd_info(docs: &[Doc]) -> Res {
 			d.keywords.source,
 			d.keywords.describe()
 		);
+		let k = &d.keywords;
+		if k.find_todo != k.todo || k.find_done != k.done {
+			println!(
+				"  find --todo: {} · find --done: {}",
+				k.find_todo.join(" "),
+				k.find_done.join(" ")
+			);
+		}
 		let mut counts: BTreeMap<String, usize> = BTreeMap::new();
 		let mut tags: BTreeMap<String, usize> = BTreeMap::new();
 		for h in &d.headings {
@@ -781,7 +802,6 @@ fn cmd_find(a: FindArgs, ctx: &Ctx) -> Res {
 
 	let prefix = docs.len() > 1;
 	let mut hits = vec![];
-	let mut total = 0;
 	for d in &docs {
 		for s in &a.status {
 			if !s.eq_ignore_ascii_case("none") && d.keywords.canonical(s).is_none() {
@@ -803,10 +823,10 @@ fn cmd_find(a: FindArgs, ctx: &Ctx) -> Res {
 				}) {
 				continue;
 			}
-			if a.todo && !kw.is_some_and(|k| !d.keywords.is_done(k)) {
+			if a.todo && !kw.is_some_and(|k| d.keywords.find_todo.iter().any(|x| x == k)) {
 				continue;
 			}
-			if a.done && !kw.is_some_and(|k| d.keywords.is_done(k)) {
+			if a.done && !kw.is_some_and(|k| d.keywords.find_done.iter().any(|x| x == k)) {
 				continue;
 			}
 			if a.level.is_some_and(|l| l != h.level)
@@ -870,12 +890,23 @@ fn cmd_find(a: FindArgs, ctx: &Ctx) -> Res {
 					continue;
 				}
 			}
-			total += 1;
-			if hits.len() < a.limit {
-				hits.push((d, i));
-			}
+			hits.push((d, i));
 		}
 	}
+	if let Some(by) = a.sort {
+		let kind = match by {
+			SortBy::Scheduled => PlanKind::Scheduled,
+			SortBy::Deadline => PlanKind::Deadline,
+			SortBy::Closed => PlanKind::Closed,
+		};
+		// stable sort: undated keep file order at the end
+		hits.sort_by_key(|(d, i)| {
+			let t = d.headings[*i].planning.get(kind);
+			(t.is_none(), t.map(|t| (t.date, t.time.clone())))
+		});
+	}
+	let total = hits.len();
+	hits.truncate(a.limit);
 	if ctx.json {
 		return print_json(&json!({
 			"total": total,

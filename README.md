@@ -25,6 +25,7 @@ rorg find work.org --todo --deadline ..+7d      # open items due within a week (
 rorg find work.org --date 2026-11-10   # scheduled/deadline/active timestamp on that day
 rorg find work.org --text vendor --in-body --tag client
 rorg find work.org --scheduled none --todo      # unscheduled open tasks
+rorg find work.org --todo --scheduled --sort scheduled   # planned open tasks, by date (like agenda)
 rorg show work.org 2.3                 # metadata + children, body size only
 rorg show work.org 2.3 --body          # plus body text
 rorg grep 'invoice' work.org           # matching lines with owning heading id
@@ -50,7 +51,9 @@ safety add `--expect TEXT` (aborts unless the target title contains TEXT).
 ## Dates
 
 `YYYY-MM-DD`, `today`, `tomorrow`, `yesterday`, `+3d`, `-1w`, `+1m`, `fri` (next Friday, today included).
-Ranges: `A..B`, `..B`, `A..`, `overdue`, `week`. Planning filters also take `any` / `none`.
+Ranges: `A..B`, `..B`, `A..`, `overdue`, `week`. Planning filters (`--scheduled`, `--deadline`,
+`--closed`) also take `any` / `none`; given without a value they mean `any` — put them after the
+file paths (or write `--scheduled=any`), otherwise the path is taken as the value.
 Repeaters (`+1w`, `++1d`, `.+1m`) are expanded when matching ranges.
 
 ## Writing
@@ -77,6 +80,11 @@ Taken from the file's `#+TODO:` / `#+SEQ_TODO:` lines; otherwise `$RORG_TODO`
 (e.g. `export RORG_TODO="TODO NEXT WAIT | DONE CANCELLED"`); otherwise a broad default
 (`TODO NEXT STARTED IN-PROGRESS WAIT WAITING HOLD SOMEDAY | DONE CANCELLED CANCELED`).
 A word is only treated as a keyword if it is in that list. Check with `rorg info`.
+
+The `|` split drives org semantics (CLOSED on done, hiding done items in agenda).
+`find --todo` / `--done` match the same split unless narrowed with
+`$RORG_FIND_TODO` / `$RORG_FIND_DONE`, e.g. `RORG_FIND_TODO="TODO WAIT"` to leave
+projects out of `--todo`, `RORG_FIND_DONE="DONE OKAY"` to leave cancelled items out of `--done`.
 
 Protected tags are configurable via `$RORG_PROTECT_TAGS` (default `crypt,secret`).
 
