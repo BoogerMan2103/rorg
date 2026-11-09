@@ -13,6 +13,7 @@ use regex::RegexBuilder;
 use serde::Serialize;
 use serde_json::json;
 use std::collections::BTreeMap;
+use std::ffi::OsString;
 use std::io::{IsTerminal, Read};
 use std::path::{Path, PathBuf};
 use ts::{DateFilter, DateRange};
@@ -27,10 +28,45 @@ Positional ids shift after add/move/delete — re-query (every write prints the 
 or guard writes with --expect TEXT (aborts unless the target title contains TEXT).
 Bodies of headings tagged crypt/secret (or inheriting them) are hidden unless --reveal ($RORG_PROTECT_TAGS).
 TODO keywords come from #+TODO lines, else $RORG_TODO, else a broad default (see `rorg info`).
-$RORG_FIND_TODO / $RORG_FIND_DONE (space-separated) narrow what find --todo / --done match.";
+$RORG_FIND_TODO / $RORG_FIND_DONE (space-separated) narrow what find --todo / --done match.
+$RORG_FILE: default org file — the FILE / PATHS argument may then be omitted.";
+
+const EXAMPLES: &str = "Examples:
+  Overview of a file (keywords, tags)    rorg info work.org
+  Heading tree, two levels deep          rorg outline work.org --depth 2
+  Find open tasks tagged urgent          rorg find work.org --todo --tag urgent
+  Find what is due this week             rorg find work.org --deadline week --sort deadline
+  Read one entry with its body           rorg show work.org 2.3 --body
+  Search text across a directory         rorg grep invoice ~/org
+  Agenda for the next 7 days             rorg agenda ~/org
+  Clocked time this week                 rorg clock work.org -r week
+  Mark a task done                       rorg status work.org 2.3 DONE
+  Rename a heading                       rorg title work.org 2.3 \"New title\"
+  Add / remove tags                      rorg tag work.org 2.3 --add urgent --rm someday
+  Set priority                           rorg priority work.org 2.3 A
+  Schedule for Friday 10:00              rorg schedule work.org 2.3 \"fri 10:00\"
+  Set a deadline (`none` removes it)     rorg deadline work.org 2.3 +3d
+  Set a property                         rorg prop work.org 2.3 OWNER me
+  Append text to the body                rorg body work.org 2.3 \"Called them, waiting\"
+  Add a timestamped note                 rorg note work.org 2.3 \"Deployed, no errors\"
+  Add a new entry under heading 2        rorg add work.org --under 2 --title \"Ping vendor\" --status TODO
+  Add a top-level entry                  rorg add work.org --top --title \"Ideas\"
+  Move (refile) a subtree                rorg move work.org 2.3 --under @Archive
+  Delete an entry, guarded by title      rorg delete work.org 2.3 --expect \"Ping vendor\"
+  Preview any write without saving       rorg status work.org 2.3 DONE --dry-run
+
+With RORG_FILE=work.org exported, drop the file: rorg status 2.3 DONE";
+
+const RORG_FILE: &str = "RORG_FILE";
+
+/// Subcommands whose first positional is a single org FILE.
+const FILE_CMDS: &[&str] = &[
+	"show", "status", "title", "tag", "priority", "schedule", "deadline", "prop", "body", "note",
+	"add", "delete", "move",
+];
 
 #[derive(Parser)]
-#[command(name = "rorg", version, about = "Agent-friendly org-mode query/edit CLI", long_about = ABOUT)]
+#[command(name = "rorg", version, about = "Agent-friendly org-mode query/edit CLI", long_about = ABOUT, after_long_help = EXAMPLES)]
 struct Cli {
 	/// JSON output (outline, find, show, grep, writes)
 	#[arg(long, global = true)]
@@ -49,14 +85,12 @@ struct Cli {
 enum Cmd {
 	/// Overview: size, TODO keywords, keyword counts, tags
 	Info {
-		/// Org files or directories (searched recursively for *.org)
-		#[arg(required = true)]
+		/// Org files or directories (searched recursively for *.org); default $RORG_FILE
 		paths: Vec<PathBuf>,
 	},
 	/// Heading tree (no bodies)
 	Outline {
-		/// Org files or directories (searched recursively for *.org)
-		#[arg(required = true)]
+		/// Org files or directories (searched recursively for *.org); default $RORG_FILE
 		paths: Vec<PathBuf>,
 		/// Max heading level to show
 		#[arg(short, long)]
@@ -69,7 +103,7 @@ enum Cmd {
 	Find(FindArgs),
 	/// One heading: metadata, children; body only with --body (--context adds ancestors)
 	Show {
-		/// Org file
+		/// Org file (may be omitted when $RORG_FILE is set)
 		file: PathBuf,
 		/// Target heading: 1.2.3 | L42 | id:X | @title-substring | @=Exact title
 		sel: String,
@@ -96,8 +130,7 @@ enum Cmd {
 	Grep {
 		/// Regex; case-insensitive unless it contains uppercase (smart case)
 		pattern: String,
-		/// Org files or directories (searched recursively for *.org)
-		#[arg(required = true)]
+		/// Org files or directories (searched recursively for *.org); default $RORG_FILE
 		paths: Vec<PathBuf>,
 		/// Case-sensitive (default: smart case)
 		#[arg(short = 's', long)]
@@ -111,8 +144,7 @@ enum Cmd {
 	},
 	/// Scheduled/deadline/timestamped open items by day, plus overdue
 	Agenda {
-		/// Org files or directories (searched recursively for *.org)
-		#[arg(required = true)]
+		/// Org files or directories (searched recursively for *.org); default $RORG_FILE
 		paths: Vec<PathBuf>,
 		/// Date range, e.g. today..+6d, week, 2026-11-01..2026-11-30
 		#[arg(short, long, default_value = "today..+6d")]
@@ -123,8 +155,7 @@ enum Cmd {
 	},
 	/// Clocked time per heading
 	Clock {
-		/// Org files or directories (searched recursively for *.org)
-		#[arg(required = true)]
+		/// Org files or directories (searched recursively for *.org); default $RORG_FILE
 		paths: Vec<PathBuf>,
 		/// Only CLOCK entries starting in this range
 		#[arg(short, long)]
@@ -132,7 +163,7 @@ enum Cmd {
 	},
 	/// Set TODO keyword (`none` to clear). Adds/removes CLOSED like org-log-done; handles repeaters
 	Status {
-		/// Org file
+		/// Org file (may be omitted when $RORG_FILE is set)
 		file: PathBuf,
 		/// Target heading: 1.2.3 | L42 | id:X | @title-substring | @=Exact title
 		sel: String,
@@ -144,7 +175,7 @@ enum Cmd {
 	},
 	/// Replace heading title (keyword, priority, tags kept)
 	Title {
-		/// Org file
+		/// Org file (may be omitted when $RORG_FILE is set)
 		file: PathBuf,
 		/// Target heading: 1.2.3 | L42 | id:X | @title-substring | @=Exact title
 		sel: String,
@@ -153,7 +184,7 @@ enum Cmd {
 	},
 	/// Change tags
 	Tag {
-		/// Org file
+		/// Org file (may be omitted when $RORG_FILE is set)
 		file: PathBuf,
 		/// Target heading: 1.2.3 | L42 | id:X | @title-substring | @=Exact title
 		sel: String,
@@ -169,7 +200,7 @@ enum Cmd {
 	},
 	/// Set priority letter, or `none`
 	Priority {
-		/// Org file
+		/// Org file (may be omitted when $RORG_FILE is set)
 		file: PathBuf,
 		/// Target heading: 1.2.3 | L42 | id:X | @title-substring | @=Exact title
 		sel: String,
@@ -178,7 +209,7 @@ enum Cmd {
 	},
 	/// Set SCHEDULED (`none` removes). WHEN: DATE [HH:MM] [+1w] [-2d] or raw <...>
 	Schedule {
-		/// Org file
+		/// Org file (may be omitted when $RORG_FILE is set)
 		file: PathBuf,
 		/// Target heading: 1.2.3 | L42 | id:X | @title-substring | @=Exact title
 		sel: String,
@@ -187,7 +218,7 @@ enum Cmd {
 	},
 	/// Set DEADLINE (`none` removes)
 	Deadline {
-		/// Org file
+		/// Org file (may be omitted when $RORG_FILE is set)
 		file: PathBuf,
 		/// Target heading: 1.2.3 | L42 | id:X | @title-substring | @=Exact title
 		sel: String,
@@ -196,7 +227,7 @@ enum Cmd {
 	},
 	/// Set a property in the :PROPERTIES: drawer (omit VALUE with --unset to remove)
 	Prop {
-		/// Org file
+		/// Org file (may be omitted when $RORG_FILE is set)
 		file: PathBuf,
 		/// Target heading: 1.2.3 | L42 | id:X | @title-substring | @=Exact title
 		sel: String,
@@ -210,7 +241,7 @@ enum Cmd {
 	},
 	/// Append to (default) or replace the free-text body. Without TEXT reads stdin
 	Body {
-		/// Org file
+		/// Org file (may be omitted when $RORG_FILE is set)
 		file: PathBuf,
 		/// Target heading: 1.2.3 | L42 | id:X | @title-substring | @=Exact title
 		sel: String,
@@ -225,7 +256,7 @@ enum Cmd {
 	},
 	/// Add a timestamped note (like org C-c C-z), newest first. Without TEXT reads stdin
 	Note {
-		/// Org file
+		/// Org file (may be omitted when $RORG_FILE is set)
 		file: PathBuf,
 		/// Target heading: 1.2.3 | L42 | id:X | @title-substring | @=Exact title
 		sel: String,
@@ -237,7 +268,7 @@ enum Cmd {
 	},
 	/// Insert a new heading
 	Add {
-		/// Org file
+		/// Org file (may be omitted when $RORG_FILE is set)
 		file: PathBuf,
 		#[command(flatten)]
 		pos: PosArgs,
@@ -265,14 +296,14 @@ enum Cmd {
 	},
 	/// Delete a heading with its whole subtree
 	Delete {
-		/// Org file
+		/// Org file (may be omitted when $RORG_FILE is set)
 		file: PathBuf,
 		/// Target heading: 1.2.3 | L42 | id:X | @title-substring | @=Exact title
 		sel: String,
 	},
 	/// Move a subtree (refile within the file); levels are adjusted
 	Move {
-		/// Org file
+		/// Org file (may be omitted when $RORG_FILE is set)
 		file: PathBuf,
 		/// Target heading: 1.2.3 | L42 | id:X | @title-substring | @=Exact title
 		sel: String,
@@ -303,8 +334,7 @@ struct PosArgs {
 
 #[derive(Args)]
 struct FindArgs {
-	/// Org files or directories (searched recursively for *.org)
-	#[arg(required = true)]
+	/// Org files or directories (searched recursively for *.org); default $RORG_FILE
 	paths: Vec<PathBuf>,
 	/// Keywords, comma-separated; `none` = no keyword
 	#[arg(short, long, value_delimiter = ',')]
@@ -380,7 +410,7 @@ struct Ctx {
 }
 
 fn main() {
-	let cli = Cli::parse();
+	let cli = parse_cli();
 	let now = Local::now().naive_local();
 	let ctx = Ctx {
 		json: cli.json,
@@ -392,6 +422,68 @@ fn main() {
 	if let Err(e) = run(cli.cmd, &ctx) {
 		eprintln!("error: {e}");
 		std::process::exit(1);
+	}
+}
+
+/// Parses argv; with $RORG_FILE set, single-file commands may omit FILE.
+/// Argv is taken as-is when it parses and its FILE exists; otherwise $RORG_FILE
+/// is inserted as FILE right after the subcommand name.
+fn parse_cli() -> Cli {
+	use clap::error::ErrorKind;
+	let args: Vec<OsString> = std::env::args_os().collect();
+	let first = Cli::try_parse_from(&args);
+	if let Err(e) = &first
+		&& matches!(e.kind(), ErrorKind::DisplayHelp | ErrorKind::DisplayVersion)
+	{
+		e.exit();
+	}
+	let as_is_ok = matches!(&first, Ok(c) if c.cmd.file().is_none_or(Path::exists));
+	if !as_is_ok
+		&& let Some(f) = std::env::var_os(RORG_FILE).filter(|f| !f.is_empty())
+		&& let Some(i) = file_cmd_index(&args)
+	{
+		let mut with_env = args.clone();
+		with_env.insert(i + 1, f);
+		match (Cli::try_parse_from(&with_env), first) {
+			(Ok(c), _) | (Err(_), Ok(c)) => return c,
+			(Err(e), Err(_)) => e.exit(),
+		}
+	}
+	first.unwrap_or_else(|e| e.exit())
+}
+
+/// Index of the subcommand name in argv, if it is one of FILE_CMDS.
+fn file_cmd_index(args: &[OsString]) -> Option<usize> {
+	let mut i = 1;
+	while let Some(a) = args.get(i).and_then(|a| a.to_str()) {
+		match a {
+			"--json" | "--dry-run" => i += 1,
+			"--expect" => i += 2,
+			_ if a.starts_with("--expect=") => i += 1,
+			_ => return FILE_CMDS.contains(&a).then_some(i),
+		}
+	}
+	None
+}
+
+impl Cmd {
+	fn file(&self) -> Option<&Path> {
+		match self {
+			Cmd::Show { file, .. }
+			| Cmd::Status { file, .. }
+			| Cmd::Title { file, .. }
+			| Cmd::Tag { file, .. }
+			| Cmd::Priority { file, .. }
+			| Cmd::Schedule { file, .. }
+			| Cmd::Deadline { file, .. }
+			| Cmd::Prop { file, .. }
+			| Cmd::Body { file, .. }
+			| Cmd::Note { file, .. }
+			| Cmd::Add { file, .. }
+			| Cmd::Delete { file, .. }
+			| Cmd::Move { file, .. } => Some(file),
+			_ => None,
+		}
 	}
 }
 
@@ -631,6 +723,15 @@ fn collect_org(p: &Path, out: &mut Vec<PathBuf>) -> Res {
 }
 
 fn load_all(paths: &[PathBuf]) -> Res<Vec<Doc>> {
+	let env_file;
+	let paths = match (paths.is_empty(), std::env::var_os(RORG_FILE)) {
+		(false, _) => paths,
+		(true, Some(f)) if !f.is_empty() => {
+			env_file = [PathBuf::from(f)];
+			&env_file[..]
+		},
+		_ => return Err(format!("no files given (pass PATHS or set ${RORG_FILE})")),
+	};
 	let mut files = vec![];
 	for p in paths {
 		collect_org(p, &mut files)?;

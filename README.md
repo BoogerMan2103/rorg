@@ -96,6 +96,9 @@ pass `--drawer` or set `RORG_LOG_INTO_DRAWER=1` to put them into `:LOGBOOK:`.
 
 Protected tags are configurable via `$RORG_PROTECT_TAGS` (default `crypt,secret`).
 
+`$RORG_FILE` sets a default org file: the FILE / PATHS argument may then be omitted
+(`export RORG_FILE=~/org/work.org; rorg status 2.3 DONE`). An explicitly passed file still wins.
+
 ## Instructions for agents
 
 Paste into `CLAUDE.md` / `AGENTS.md` of the directory with org files:
