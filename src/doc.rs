@@ -318,10 +318,18 @@ impl Doc {
 	// ---------- navigation ----------
 
 	pub fn breadcrumb(&self, i: usize) -> Vec<&str> {
+		self.ancestors(i)
+			.into_iter()
+			.map(|j| self.headings[j].title.as_str())
+			.collect()
+	}
+
+	/// Ancestor indices, root first.
+	pub fn ancestors(&self, i: usize) -> Vec<usize> {
 		let mut out = vec![];
 		let mut p = self.headings[i].parent;
 		while let Some(j) = p {
-			out.push(self.headings[j].title.as_str());
+			out.push(j);
 			p = self.headings[j].parent;
 		}
 		out.reverse();

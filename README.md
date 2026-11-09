@@ -28,6 +28,7 @@ rorg find work.org --scheduled none --todo      # unscheduled open tasks
 rorg find work.org --todo --scheduled --sort scheduled   # planned open tasks, by date (like agenda)
 rorg show work.org 2.3                 # metadata + children, body size only
 rorg show work.org 2.3 --body          # plus body text
+rorg show work.org 2.3 --context       # body plus bodies of all parent headings
 rorg show work.org "** WAIT Ping vendor :client:" --body   # heading pasted from Emacs
 rorg grep 'invoice' work.org           # matching lines with owning heading id
 rorg agenda ~/org -r today..+6d        # by day, plus overdue
@@ -103,7 +104,7 @@ Paste into `CLAUDE.md` / `AGENTS.md` of the directory with org files:
 Org files here are managed through the `rorg` CLI. Do NOT cat/Read whole .org files.
 - Orient: `rorg info <file>`, `rorg outline <file> --depth 2`.
 - Locate: `rorg find` (filters: --status, --todo, --text, --in-body, --tag, --date, --scheduled, --deadline), `rorg grep`.
-- Inspect one entry: `rorg show <file> <id>`; add `--body` only when the body is needed.
+- Inspect one entry: `rorg show <file> <id>`; add `--body` only when the body is needed, `--context` when parent headings' bodies matter too.
 - Edit only via rorg write commands; pass `--expect "<title words>"` on writes; ids shift after add/move/delete, so re-query.
 - Never pass `--reveal` unless the user explicitly asks to see a protected entry.
 ```

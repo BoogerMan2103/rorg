@@ -371,3 +371,11 @@ fn notes() {
 	);
 	assert!(d.add_note(h, "  \n", now(), false).is_err());
 }
+
+#[test]
+fn ancestors_root_first() {
+	let d = doc();
+	let i = d.resolve("1.2").unwrap();
+	assert_eq!(d.ancestors(i), vec![d.resolve("1").unwrap()]);
+	assert!(d.ancestors(d.resolve("1").unwrap()).is_empty());
+}

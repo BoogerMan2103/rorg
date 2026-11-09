@@ -67,7 +67,7 @@ enum Cmd {
 	},
 	/// Find headings by keyword, text, tags, dates, properties
 	Find(FindArgs),
-	/// One heading: metadata, children; body only with --body
+	/// One heading: metadata, children; body only with --body (--context adds ancestors)
 	Show {
 		/// Org file
 		file: PathBuf,
@@ -76,6 +76,9 @@ enum Cmd {
 		/// Print the free-text body (without drawers)
 		#[arg(long)]
 		body: bool,
+		/// Like --body, plus the bodies of all ancestor headings (root first)
+		#[arg(long, conflicts_with = "raw")]
+		context: bool,
 		/// Print raw lines of the section (heading, planning, drawers, body)
 		#[arg(long)]
 		raw: bool,
@@ -405,6 +408,7 @@ fn run(cmd: Cmd, ctx: &Ctx) -> Res {
 			file,
 			sel,
 			body,
+			context,
 			raw,
 			subtree,
 			max_lines,
@@ -412,7 +416,8 @@ fn run(cmd: Cmd, ctx: &Ctx) -> Res {
 		} => cmd_show(
 			&Doc::load(&file)?,
 			&sel,
-			body,
+			body || context,
+			context,
 			raw,
 			subtree,
 			max_lines,
@@ -1025,6 +1030,7 @@ fn cmd_show(
 	d: &Doc,
 	sel: &str,
 	body: bool,
+	context: bool,
 	raw: bool,
 	subtree: bool,
 	max: usize,
@@ -1032,6 +1038,19 @@ fn cmd_show(
 	ctx: &Ctx,
 ) -> Res {
 	let i = d.resolve(sel)?;
+	// (ancestor, body lines or None when protected and not revealed)
+	let ancestors: Vec<(usize, Option<Vec<&str>>)> = if context {
+		d.ancestors(i)
+			.into_iter()
+			.map(|j| {
+				let lines = (reveal || !d.is_protected(j))
+					.then(|| d.lines[d.body_range(j)].iter().map(String::as_str).collect());
+				(j, lines)
+			})
+			.collect()
+	} else {
+		vec![]
+	};
 	let h = &d.headings[i];
 	let protected = if subtree && raw {
 		(0..d.headings.len()).any(|j| (j == i || d.is_descendant(j, i)) && d.is_protected(j))
@@ -1069,6 +1088,14 @@ fn cmd_show(
 			"body": if body && !hidden { Some(body_lines.iter().take(max).collect::<Vec<_>>()) } else { None },
 			"raw": if raw && !hidden { Some(raw_lines.iter().take(max).collect::<Vec<_>>()) } else { None },
 			"hidden": hidden,
+			"context": if context {
+				Some(ancestors.iter().map(|(j, lines)| json!({
+					"heading": heading_out(d, *j),
+					"body_line_count": d.body_range(*j).len(),
+					"body": lines.as_ref().map(|l| l.iter().take(max).collect::<Vec<_>>()),
+					"hidden": lines.is_none(),
+				})).collect::<Vec<_>>())
+			} else { None },
 		}));
 	}
 
@@ -1136,6 +1163,13 @@ fn cmd_show(
 	}
 	if protected {
 		println!("protected: yes ({})", d.protected_tags.join(","));
+	}
+	for (j, lines) in &ancestors {
+		println!("--- context: {} ---", heading_line(d, *j, false, false));
+		match lines {
+			Some(l) => print_capped(l, max),
+			None => println!("[content hidden: protected heading]"),
+		}
 	}
 	if hidden {
 		println!(
